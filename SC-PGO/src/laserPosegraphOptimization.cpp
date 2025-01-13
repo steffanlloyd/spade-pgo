@@ -23,6 +23,8 @@
 #include <pcl/octree/octree_pointcloud_voxelcentroid.h>
 #include <pcl/filters/crop_box.h> 
 #include <pcl_conversions/pcl_conversions.h>
+#include <pcl/registration/gicp.h>
+#include <pcl/registration/ndt.h>
 
 #include <ros/ros.h>
 #include <sensor_msgs/Imu.h>
@@ -117,20 +119,32 @@ pcl::PointCloud<PointType>::Ptr laserCloudMapPGO(new pcl::PointCloud<PointType>(
 pcl::VoxelGrid<PointType> downSizeFilterMapPGO;
 bool laserCloudMapPGORedraw = true;    
 
-bool useGPS = true;
-bool use_gps_elevation = false;
-// bool useGPS = false;
 nav_msgs::Odometry::ConstPtr currGPS, lastGPS;
+//Eigen::Vector3d initGPS;
 bool hasGPSforThisKF = false;
 bool gpsOffsetInitialized = false; 
 double gpsAltitudeInitOffset = 0.0;
 double recentOptimizedX = 0.0;
 double recentOptimizedY = 0.0;
 double recentOptimizedZ = 0.0;
-double gps_dist_thr = 50.0;
-u_int8_t gps_init_thr = 20;
-size_t gps_counter = 0;
-bool gps_init = false;
+bool useGPS;
+bool useGPSElevation;
+double gpsDistThr;
+double gpsCovThr;
+double gpsScale;
+bool firstGPS = true;
+double filterSC;
+//u_int8_t gps_init_thr = 20;
+//size_t gps_counter = 0;
+//bool gps_init = false;
+
+//ICP params (loop closing)
+int numHistKeyframesIcpOld, numHistKeyframesIcpCurr;
+double loopIcpFitnessScoreThreshold;
+double filterIcp;
+double loopNoiseScore;
+
+std::string gpsTopic;
 
 std::vector<gtsam::GPSFactor> keyframeGPSfactor;
 
@@ -231,7 +245,6 @@ void initNoises( void )
     odomNoiseVector6 << 1e-6, 1e-6, 1e-6, 1e-4, 1e-4, 1e-4;
     odomNoise = noiseModel::Diagonal::Variances(odomNoiseVector6);
 
-    double loopNoiseScore = 0.5; // constant is ok...
     gtsam::Vector robustNoiseVector6(6); // gtsam::Pose3 factor has 6 elements (6D)
     robustNoiseVector6 << loopNoiseScore, loopNoiseScore, loopNoiseScore, loopNoiseScore, loopNoiseScore, loopNoiseScore;
     robustLoopNoise = gtsam::noiseModel::Robust::Create(
@@ -410,17 +423,17 @@ pcl::PointCloud<PointType>::Ptr transformPointCloud(pcl::PointCloud<PointType>::
     return cloudOut;
 } // transformPointCloud
 
-void loopFindNearKeyframesCloud( pcl::PointCloud<PointType>::Ptr& nearKeyframes, const int& key, const int& submap_size, const int& root_idx)
+void loopFindNearKeyframesCloud( pcl::PointCloud<PointType>::Ptr& nearKeyframes, const int& key, const int& submap_size)
 {
     // extract and stacking near keyframes (in global coord)
-    nearKeyframes->clear();
+    nearKeyframes->clear();   
     for (int i = -submap_size; i <= submap_size; ++i) {
         int keyNear = key + i;
         if (keyNear < 0 || keyNear >= int(keyframeLaserClouds.size()) )
             continue;
 
         mKF.lock(); 
-        *nearKeyframes += * local2global(keyframeLaserClouds[keyNear], keyframePosesUpdated[root_idx]);
+        *nearKeyframes += * local2global(keyframeLaserClouds[keyNear], keyframePosesUpdated[keyNear]);
         mKF.unlock(); 
     }
 
@@ -428,27 +441,25 @@ void loopFindNearKeyframesCloud( pcl::PointCloud<PointType>::Ptr& nearKeyframes,
         return;
 
     // downsample near keyframes
-    pcl::PointCloud<PointType>::Ptr cloud_temp(new pcl::PointCloud<PointType>());
+    pcl::PointCloud<PointType>::Ptr cloud_temp(new pcl::PointCloud<PointType>());  
     downSizeFilterICP.setInputCloud(nearKeyframes);
     downSizeFilterICP.filter(*cloud_temp);
     *nearKeyframes = *cloud_temp;
 } // loopFindNearKeyframesCloud
 
-
+    
 std::optional<gtsam::Pose3> doICPVirtualRelative( int _loop_kf_idx, int _curr_kf_idx )
 {
     // parse pointclouds
-    int historyKeyframeSearchNum = 25; // enough. ex. [-25, 25] covers submap length of 50x1 = 50m if every kf gap is 1m
     pcl::PointCloud<PointType>::Ptr cureKeyframeCloud(new pcl::PointCloud<PointType>());
-    pcl::PointCloud<PointType>::Ptr targetKeyframeCloud(new pcl::PointCloud<PointType>());
-    //loopFindNearKeyframesCloud(cureKeyframeCloud, _curr_kf_idx, 0, _loop_kf_idx); // use same root of loop kf idx 
-    loopFindNearKeyframesCloud(cureKeyframeCloud, _loop_kf_idx, 4, _loop_kf_idx); // use same root of loop kf idx 
-    loopFindNearKeyframesCloud(targetKeyframeCloud, _loop_kf_idx, historyKeyframeSearchNum, _loop_kf_idx); 
+    pcl::PointCloud<PointType>::Ptr targetKeyframeCloud(new pcl::PointCloud<PointType>());     
+    loopFindNearKeyframesCloud(cureKeyframeCloud, _curr_kf_idx, numHistKeyframesIcpCurr); // use same root of loop kf idx 
+    loopFindNearKeyframesCloud(targetKeyframeCloud, _loop_kf_idx, numHistKeyframesIcpOld);   
 
-    // loop verification 
-    sensor_msgs::PointCloud2 cureKeyframeCloudMsg;
+    // loop verification         
+    sensor_msgs::PointCloud2 cureKeyframeCloudMsg;   
     pcl::toROSMsg(*cureKeyframeCloud, cureKeyframeCloudMsg);
-    cureKeyframeCloudMsg.header.frame_id = "camera_init";
+    cureKeyframeCloudMsg.header.frame_id = "camera_init";     
     pubLoopScanLocal.publish(cureKeyframeCloudMsg);
 
     sensor_msgs::PointCloud2 targetKeyframeCloudMsg;
@@ -456,26 +467,54 @@ std::optional<gtsam::Pose3> doICPVirtualRelative( int _loop_kf_idx, int _curr_kf
     targetKeyframeCloudMsg.header.frame_id = "camera_init";
     pubLoopSubmapLocal.publish(targetKeyframeCloudMsg);
 
-    // ICP Settings
+    // ------------------------   
+    //  Coarse ICP
+    // ------------------------
+    // pcl::IterativeClosestPoint<PointType, PointType> icp_coarse;
+    // icp_coarse.setMaxCorrespondenceDistance(30.0);   // smaller threshold for fine
+    // icp_coarse.setMaximumIterations(100);
+    // icp_coarse.setTransformationEpsilon(1e-6);
+    // icp_coarse.setEuclideanFitnessEpsilon(1e-6);
+
+    // icp_coarse.setInputSource(cureKeyframeCloud);
+    // icp_coarse.setInputTarget(targetKeyframeCloud);
+
+    // pcl::PointCloud<PointType>::Ptr coarse_result(new pcl::PointCloud<PointType>());   
+    // // If you have a known initial guess (e.g., from the yaw difference or prior pose difference),
+    // // pass it in as the second argument to align(). 
+    // // Otherwise, pass an identity matrix or omit it.
+    // icp_coarse.align(*coarse_result);
+
+    // if (!icp_coarse.hasConverged()) 
+    // {
+    //     ROS_WARN("[SC loop] Coarse ICP did not converge.");
+    //     return std::nullopt;
+    // }
+
+    // ------------------------
+    //  Fine ICP
+    // ------------------------
     pcl::IterativeClosestPoint<PointType, PointType> icp;
-    icp.setMaxCorrespondenceDistance(150); // giseop , use a value can cover 2*historyKeyframeSearchNum range in meter 
+    icp.setMaxCorrespondenceDistance(130.0);   // smaller threshold for fine
     icp.setMaximumIterations(100);
     icp.setTransformationEpsilon(1e-6);
     icp.setEuclideanFitnessEpsilon(1e-6);
     icp.setRANSACIterations(0);
 
-    // Align pointclouds
     icp.setInputSource(cureKeyframeCloud);
     icp.setInputTarget(targetKeyframeCloud);
-    pcl::PointCloud<PointType>::Ptr unused_result(new pcl::PointCloud<PointType>());
-    icp.align(*unused_result);
+
+    pcl::PointCloud<PointType>::Ptr fine_result(new pcl::PointCloud<PointType>());
+
+    // Use the coarse ICP’s final transformation as the initial guess
+    //icp.align(*fine_result, icp_coarse.getFinalTransformation());
+    icp.align(*fine_result);
  
-    float loopFitnessScoreThreshold = 0.3; // user parameter but fixed low value is safe. 
-    if (icp.hasConverged() == false || icp.getFitnessScore() > loopFitnessScoreThreshold) {
-        std::cout << "[SC loop] ICP fitness test failed (" << icp.getFitnessScore() << " > " << loopFitnessScoreThreshold << "). Reject this SC loop." << std::endl;
+    if (icp.hasConverged() == false || icp.getFitnessScore() > loopIcpFitnessScoreThreshold) {
+        std::cout << "[SC loop] ICP fitness test failed (" << icp.getFitnessScore() << " > " << loopIcpFitnessScoreThreshold << "). Reject this SC loop." << std::endl;
         return std::nullopt;
     } else {
-        std::cout << "[SC loop] ICP fitness test passed (" << icp.getFitnessScore() << " < " << loopFitnessScoreThreshold << "). Add this SC loop." << std::endl;
+        std::cout << "[SC loop] ICP fitness test passed (" << icp.getFitnessScore() << " < " << loopIcpFitnessScoreThreshold << "). Add this SC loop." << std::endl;
     }
 
     // Get pose transformation
@@ -615,33 +654,58 @@ void process_pg()
                     gtSAMgraph.add(gtsam::BetweenFactor<gtsam::Pose3>(prev_node_idx, curr_node_idx, poseFrom.between(poseTo), odomNoise));
 
                     // gps factor 
-                    if(hasGPSforThisKF) {
+
+                    // Check the covariances of GPS (x,y)
+                    bool addGps = false;
+
+                    if(currGPS != nullptr)
+                        addGps = (currGPS->pose.covariance[0] < gpsCovThr && currGPS->pose.covariance[7] < gpsCovThr) ? 1 : 0;
+                    
+                    if(hasGPSforThisKF && addGps) {
+
                         // double curr_altitude_offseted = currGPS->altitude - gpsAltitudeInitOffset;
                         //Just for the first frame -> Initialize
-                        if(lastGPS == nullptr) lastGPS = currGPS;
+                        if(lastGPS == nullptr) 
+                            lastGPS = currGPS;
+                        
                         //Add gps correction after few meters. TODO: Create a function for distance
                         if(sqrt(( currGPS->pose.pose.position.x - lastGPS->pose.pose.position.x ) * ( currGPS->pose.pose.position.x - lastGPS->pose.pose.position.x ) 
                             + ( currGPS->pose.pose.position.y - lastGPS->pose.pose.position.y ) * ( currGPS->pose.pose.position.y - lastGPS->pose.pose.position.y )
-                            + ( currGPS->pose.pose.position.z - lastGPS->pose.pose.position.z ) * ( currGPS->pose.pose.position.z - lastGPS->pose.pose.position.z )) > gps_dist_thr || !gps_init)
+                            + ( currGPS->pose.pose.position.z - lastGPS->pose.pose.position.z ) * ( currGPS->pose.pose.position.z - lastGPS->pose.pose.position.z )) > gpsDistThr || firstGPS)
                         {
-                            gps_counter++;
+                            firstGPS = false;
+                            float gps_noise_z;
+                            // gps_counter++;
                             gtsam::Point3 gpsConstraint;
-                            if(use_gps_elevation)
+                            if(useGPSElevation) {
                                 gpsConstraint << currGPS->pose.pose.position.x, currGPS->pose.pose.position.y, currGPS->pose.pose.position.z;
+                                gps_noise_z = currGPS->pose.covariance[14] * gpsScale;
+                            }
                             else 
                             {
                                 mtxRecentPose.lock(); //Protect recentOptimizedZ
                                 gpsConstraint << currGPS->pose.pose.position.x, currGPS->pose.pose.position.y, recentOptimizedZ;
                                 mtxRecentPose.unlock();
+                                gps_noise_z = 0.01;
                             }
                             gtsam::Vector gps_noise(3);
-                            gps_noise << currGPS->pose.covariance[0], currGPS->pose.covariance[7], currGPS->pose.covariance[14];
+
+                            // if(!gps_init)
+                            //     gps_noise << 1e-14, 1e-14, 1e-14;
+                            // else
+
+                            
+                            gps_noise << currGPS->pose.covariance[0] * gpsScale, currGPS->pose.covariance[7] * gpsScale, gps_noise_z;
                             noiseModel::Diagonal::shared_ptr gps_noise_Model =
                                     noiseModel::Diagonal::Variances(gps_noise);
                             gtSAMgraph.add(gtsam::GPSFactor(curr_node_idx, gpsConstraint, gps_noise_Model));
                             cout << "GPS factor added at node " << curr_node_idx << endl;
                             lastGPS = currGPS;
-                            if(gps_counter >= gps_init_thr) gps_init = true;        
+
+                            // if(gps_counter >= gps_init_thr) {
+                            //     gps_init = true;  
+                            //     ROS_INFO_ONCE("GPS Initialized.");
+                            // }
                         }
                     }
                     initialEstimate.insert(curr_node_idx, poseTo);                
@@ -823,19 +887,35 @@ int main(int argc, char **argv)
 
 	nh.param<double>("sc_dist_thres", scDistThres, 0.2);  
 	nh.param<double>("sc_max_radius", scMaximumRadius, 80.0); // 80 is recommended for outdoor, and lower (ex, 20, 40) values are recommended for indoor 
+    nh.param<double>("sc_leaf_size_down", filterSC, 0.4); // Scan Context point cloud downsampling
+
+    //GPS Params
+    nh.param<std::string>("gps_topic", gpsTopic, "/mavros/global_position/local"); // Scaling factor to be multiplied with gps Covariance 
+    nh.param<bool>("use_gps", useGPS, false); // Covariance threshold for gps measurement to be taken into account (before applying scaling factor)
+    nh.param<bool>("use_gps_elevation", useGPSElevation, false); // Scaling factor to be multiplied with gps Covariance 
+    nh.param<double>("gps_dist_thr", gpsDistThr, 5.0); // Distance between gps measurements to be implemented in the graph
+    nh.param<double>("gps_cov_thr", gpsCovThr, 4.0); // Covariance threshold for gps measurement to be taken into account (before applying scaling factor)
+    nh.param<double>("gps_scale", gpsScale, 1.0); // Scaling factor to be multiplied with gps Covariance 
+
+    //ICP Loop Params
+    nh.param<int>("icp_num_keyframes_old", numHistKeyframesIcpOld, 10); // Number of keyframes point cloud to be included in the submap for icp alignment (old keyframe)
+    nh.param<int>("icp_num_keyframes_curr", numHistKeyframesIcpCurr, 3); // Number of keyframes point cloud to be included in the submap for icp alignment (current keyframe)
+    nh.param<double>("icp_loop_fitness_score_thr", loopIcpFitnessScoreThreshold, 0.3); // ICP's loop fitness score threshold to accept closing a loop (i.e. registration was successful)
+    nh.param<double>("icp_leaf_size_down", filterIcp, 0.2); // ICP's downsampling   
+    nh.param<double>("loop_noise_score", loopNoiseScore, 0.8); // Loop Noise
+
 
     ISAM2Params parameters;
     parameters.relinearizeThreshold = 0.01;
     parameters.relinearizeSkip = 1;
-    isam = new ISAM2(parameters);
+    isam = new ISAM2(parameters);   
     initNoises();
-
+   
     scManager.setSCdistThres(scDistThres);
     scManager.setMaximumRadius(scMaximumRadius);
 
-    float filter_size = 0.4; 
-    downSizeFilterScancontext.setLeafSize(filter_size, filter_size, filter_size);
-    downSizeFilterICP.setLeafSize(filter_size, filter_size, filter_size);
+    downSizeFilterScancontext.setLeafSize(filterSC, filterSC, filterSC);
+    downSizeFilterICP.setLeafSize(filterIcp, filterIcp, filterIcp);
 
     double mapVizFilterSize;
 	nh.param<double>("mapviz_filter_size", mapVizFilterSize, 0.4); // pose assignment every k frames 
@@ -843,7 +923,7 @@ int main(int argc, char **argv)
 
 	ros::Subscriber subLaserCloudFullRes = nh.subscribe<sensor_msgs::PointCloud2>("/velodyne_cloud_registered_local", 100, laserCloudFullResHandler);
 	ros::Subscriber subLaserOdometry = nh.subscribe<nav_msgs::Odometry>("/aft_mapped_to_init", 100, laserOdometryHandler);
-	ros::Subscriber subGPS = nh.subscribe<nav_msgs::Odometry>("/mavros/global_position/local", 100, gpsHandler);
+	ros::Subscriber subGPS = nh.subscribe<nav_msgs::Odometry>(gpsTopic, 100, gpsHandler);
 
 	pubOdomAftPGO = nh.advertise<nav_msgs::Odometry>("/aft_pgo_odom", 100);
 	pubOdomRepubVerifier = nh.advertise<nav_msgs::Odometry>("/repub_odom", 100);

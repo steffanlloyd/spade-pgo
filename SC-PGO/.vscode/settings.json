@@ -1,0 +1,23 @@
+{
+    "files.associations": {
+        "mutex": "cpp",
+        "shared_mutex": "cpp",
+        "condition_variable": "cpp",
+        "random": "cpp",
+        "hash_map": "cpp",
+        "hash_set": "cpp",
+        "*.tcc": "cpp",
+        "deque": "cpp",
+        "list": "cpp",
+        "string": "cpp",
+        "vector": "cpp",
+        "chrono": "cpp",
+        "complex": "cpp",
+        "unordered_map": "cpp",
+        "unordered_set": "cpp",
+        "ostream": "cpp",
+        "array": "cpp",
+        "string_view": "cpp",
+        "limits": "cpp"
+    }
+}

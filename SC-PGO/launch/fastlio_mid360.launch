@@ -23,7 +23,7 @@
     <param name="sc_leaf_size_down" type="double" value="0.4"/>              <!-- for downsampling -->
 
     <param name="lidar_type" type="string" value="MID360"/>
-
+  
     <!-- GPS Parameters -->
     <param name="gps_topic" type="string" value="aaaaaa"/>
     <param name="use_gps" type="bool" value="false"/>                 
@@ -33,10 +33,11 @@
     <param name="gps_scale" type="double" value="28.0"/>                     <!-- Scaling factor to be multiplied with gps Covariance -->
 
     <!-- ICP Parameters (registration when closing loop)-->
-    <param name="icp_num_keyframes_old" type="double" value="10"/>           <!-- Number of keyframes to be kept for the submap of the old keyframe of the loop -->
-    <param name="icp_num_keyframes_curr" type="double" value="1"/>           <!-- Number of keyframes to be kept for the submap of the current keyframe of the loop (a small integer is suggested) -->
-    <param name="icp_loop_fitness_score_thr" type="double" value="0.5"/>     <!-- ICP fitness score to accept a loop closure -->
+    <param name="icp_num_keyframes_old" type="double" value="10"/>            <!-- Number of keyframes to be kept for the submap of the old keyframe of the loop -->
+    <param name="icp_num_keyframes_curr" type="double" value="2"/>           <!-- Number of keyframes to be kept for the submap of the current keyframe of the loop (a small integer is suggested) -->
+    <param name="icp_loop_fitness_score_thr" type="double" value="0.3"/>     <!-- ICP fitness score to accept a loop closure -->
     <param name="icp_leaf_size_down" type="double" value="0.2"/>             <!-- Downsampling parameters for icp point clouds -->
+    <param name="loop_noise_score" type="double" value="0.8"/>               <!-- Loop Noise. Lower to increase confidence of registration (currently ICP) -->
 
 
     <!-- input from FASTLIO2 -->
