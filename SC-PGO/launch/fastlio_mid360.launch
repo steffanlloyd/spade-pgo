@@ -41,9 +41,9 @@
 
 
     <!-- input from FASTLIO2 -->
-    <remap from="/aft_mapped_to_init" to="/Odometry"/>
-    <remap from="/velodyne_cloud_registered_local" to="/cloud_registered_body"/>
-    <remap from="/cloud_for_scancontext" to="/cloud_registered"/>          <!-- because ScanContext requires lidar-ego-centric coordinate for the better performance -->
+    <remap from="/aft_mapped_to_init" to="/Odometry"/>                     <!-- odometry topic from your LIO algorithm -->
+    <remap from="/velodyne_cloud_registered_local" to="/cloud_registered_body"/>  <!-- cloud registered to body frame topic -->
+    <remap from="/cloud_for_scancontext" to="/cloud_registered"/>          <!-- because ScanContext requires lidar-ego-centric coordinate for the better performance (cloud registered to map frame topic) -->
 
     <!-- utils -->
     <param name="save_directory" type="string" value="/home/john/SLAM_Spade/src/FAST_LIO_SLAM/SC-PGO/Data/"/>  <!-- CHANGE THIS and end with / -->
