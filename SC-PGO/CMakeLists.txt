@@ -34,6 +34,7 @@ include_directories(
   ${CERES_INCLUDE_DIRS}
   ${OpenCV_INCLUDE_DIRS}
   ${GTSAM_INCLUDE_DIR}
+  /usr/include/GeographicLib
 )
 
 catkin_package(
@@ -63,6 +64,7 @@ target_link_libraries(alaserPGO
   ${catkin_LIBRARIES} ${PCL_LIBRARIES} ${CERES_LIBRARIES}
   ${OpenMP_CXX_FLAGS}
   gtsam
+  Geographic
 )
 
 add_executable(kittiHelper src/kittiHelper.cpp)

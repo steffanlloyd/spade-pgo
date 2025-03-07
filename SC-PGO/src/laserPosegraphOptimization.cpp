@@ -35,6 +35,7 @@
 #include <nav_msgs/Odometry.h>
 #include <nav_msgs/Path.h>
 #include <geometry_msgs/PoseStamped.h>
+#include <sensor_msgs/NavSatFix.h>
 
 #include <eigen3/Eigen/Dense>
 
@@ -54,10 +55,16 @@
 #include <gtsam/nonlinear/LevenbergMarquardtOptimizer.h>
 #include <gtsam/nonlinear/ISAM2.h>
 
+#include <GeographicLib/UTMUPS.hpp>
+#include <GeographicLib/Geocentric.hpp>
+#include <GeographicLib/LocalCartesian.hpp>
+#include <GeographicLib/Geoid.hpp>
+
 #include "aloam_velodyne/common.h"
 #include "aloam_velodyne/tic_toc.h"
 
 #include "scancontext/Scancontext.h"
+
 
 using namespace gtsam;
 
@@ -73,10 +80,11 @@ bool isNowKeyFrame = false;
 
 Pose6D odom_pose_prev {0.0, 0.0, 0.0, 0.0, 0.0, 0.0}; // init 
 Pose6D odom_pose_curr {0.0, 0.0, 0.0, 0.0, 0.0, 0.0}; // init pose is zero 
+gtsam::Pose3 T_odom_to_gps;
 
 std::queue<nav_msgs::Odometry::ConstPtr> odometryBuf;
 std::queue<sensor_msgs::PointCloud2ConstPtr> fullResBuf;
-std::queue<nav_msgs::Odometry::ConstPtr> gpsBuf;
+std::queue<sensor_msgs::NavSatFix::ConstPtr> gpsBuf;
 std::queue<std::pair<int, int> > scLoopICPBuf;
 
 std::mutex mBuf;
@@ -92,6 +100,7 @@ pcl::PointCloud<PointType>::Ptr laserCloudMapAfterPGO(new pcl::PointCloud<PointT
 std::vector<pcl::PointCloud<PointType>::Ptr> keyframeLaserClouds; 
 std::vector<Pose6D> keyframePoses;
 std::vector<Pose6D> keyframePosesUpdated;
+std::vector<gtsam::GPSFactor> keyframeGpsFactor;
 std::vector<double> keyframeTimes;
 int recentIdxUpdated = 0;
 
@@ -120,9 +129,9 @@ pcl::VoxelGrid<PointType> downSizeFilterMapPGO;
 bool laserCloudMapPGORedraw = true;    
 
 nav_msgs::Odometry::ConstPtr currGPS, lastGPS;
-//Eigen::Vector3d initGPS;
 bool hasGPSforThisKF = false;
 bool gpsOffsetInitialized = false; 
+
 double gpsAltitudeInitOffset = 0.0;
 double recentOptimizedX = 0.0;
 double recentOptimizedY = 0.0;
@@ -132,11 +141,11 @@ bool useGPSElevation;
 double gpsDistThr;
 double gpsCovThr;
 double gpsScale;
-bool firstGPS = true;
 double filterSC;
-//u_int8_t gps_init_thr = 20;
-//size_t gps_counter = 0;
-//bool gps_init = false;
+u_int8_t thrInitGps = 20;
+bool gpsInit = false;
+bool firstGPS = true;
+GeographicLib::LocalCartesian geoConverter;
 
 //ICP params (loop closing)
 int numHistKeyframesIcpOld, numHistKeyframesIcpCurr;
@@ -144,11 +153,11 @@ double loopIcpFitnessScoreThreshold;
 double filterIcp;
 double loopNoiseScore;
 
+bool gotAbsMeas = false;
+
 std::string gpsTopic;
 
-std::vector<gtsam::GPSFactor> keyframeGPSfactor;
-
-ros::Publisher pubMapAftPGO, pubOdomAftPGO, pubPathAftPGO;
+ros::Publisher pubMapAftPGO, pubOdomAftPGO, pubPathAftPGO;   
 ros::Publisher pubLoopScanLocal, pubLoopSubmapLocal;
 ros::Publisher pubOdomRepubVerifier;
 
@@ -211,6 +220,92 @@ void saveOptimizedVerticesKITTIformat(gtsam::Values _estimates, std::string _fil
     }
 }
 
+nav_msgs::Odometry::ConstPtr navSatFixToUTMOdometry(const sensor_msgs::NavSatFix::ConstPtr& nav_sat_fix)
+{
+    // For UTM
+    int zone;
+    bool northp;
+    double x_utm, y_utm;
+    double gamma;
+    double scale;
+
+    // Convert from WGS84 lat/lon to UTM using GeographicLib’s UTM/UPS converter
+    GeographicLib::UTMUPS::Forward(nav_sat_fix->latitude, nav_sat_fix->longitude, zone, northp, x_utm, y_utm, gamma, scale);
+
+    // Create an Odometry message
+    nav_msgs::Odometry odom;
+    odom.header.frame_id = "map";   // Set the frame ID
+    odom.header.stamp = nav_sat_fix->header.stamp; // Use the timestamp from NavSatFix
+
+    // Set the position in the Odometry message
+    odom.pose.pose.position.x = x_utm;
+    odom.pose.pose.position.y = y_utm;
+    odom.pose.pose.position.z = nav_sat_fix->altitude;  // Use altitude for Z in the UTM frame
+
+    // Set an identity orientation if orientation information is not available
+    odom.pose.pose.orientation.w = 1.0;
+
+    // Copy covariances from NavSatFix
+    // Assuming the covariances in NavSatFix are already in the correct units
+    odom.pose.covariance[0] = nav_sat_fix->position_covariance[0];  // Variance in X (easting)
+    odom.pose.covariance[7] = nav_sat_fix->position_covariance[4];  // Variance in Y (northing)
+    odom.pose.covariance[14] = nav_sat_fix->position_covariance[8]; // Variance in Z (altitude)
+
+    // Set all other covariances to zero (you can modify this if you have specific correlations or uncertainties)
+    for (size_t i = 0; i < odom.pose.covariance.size(); ++i) {
+        if (i != 0 && i != 7 && i != 14) {
+            odom.pose.covariance[i] = 0.0;
+        }
+    }
+
+    // Create a shared pointer to the Odometry object
+    nav_msgs::Odometry::Ptr odom_ptr = boost::make_shared<nav_msgs::Odometry>(odom);
+
+    // Return a ConstPtr from that
+    return nav_msgs::Odometry::ConstPtr(odom_ptr);
+}
+
+nav_msgs::Odometry::ConstPtr navSatFixToLCOdometry(const sensor_msgs::NavSatFix::ConstPtr& nav_sat_fix)
+{
+    if (firstGPS)
+    {
+        geoConverter.Reset(nav_sat_fix->latitude, nav_sat_fix->longitude, nav_sat_fix->altitude);
+        firstGPS = false;
+    }
+
+    // Create an Odometry message
+    nav_msgs::Odometry odom;   
+    odom.header.frame_id = "map";   // Set the frame ID
+    odom.header.stamp = nav_sat_fix->header.stamp; // Use the timestamp from NavSatFix
+
+    // Set the position in the Odometry message
+    geoConverter.Forward(nav_sat_fix->latitude, nav_sat_fix->longitude, nav_sat_fix->altitude, odom.pose.pose.position.x, odom.pose.pose.position.y, odom.pose.pose.position.z);
+
+    // Set an identity orientation if orientation information is not available
+    odom.pose.pose.orientation.w = 1.0;
+
+    // Copy covariances from NavSatFix
+    // Assuming the covariances in NavSatFix are already in the correct units
+    odom.pose.covariance[0] = nav_sat_fix->position_covariance[0];  // Variance in X (easting)
+    odom.pose.covariance[7] = nav_sat_fix->position_covariance[4];  // Variance in Y (northing)
+    odom.pose.covariance[14] = nav_sat_fix->position_covariance[8]; // Variance in Z (altitude)
+
+    // Set all other covariances to zero (you can modify this if you have specific correlations or uncertainties)
+    for (size_t i = 0; i < odom.pose.covariance.size(); ++i) {
+        if (i != 0 && i != 7 && i != 14) {
+            odom.pose.covariance[i] = 0.0;
+        }
+    }
+
+    // Create a shared pointer to the Odometry object
+    nav_msgs::Odometry::Ptr odom_ptr = boost::make_shared<nav_msgs::Odometry>(odom);
+
+    //geoConverter.Reverse ... for acquiring LLA
+
+    // Return a ConstPtr from that
+    return nav_msgs::Odometry::ConstPtr(odom_ptr);
+}
+
 void laserOdometryHandler(const nav_msgs::Odometry::ConstPtr &_laserOdometry)
 {
 	mBuf.lock();
@@ -225,20 +320,21 @@ void laserCloudFullResHandler(const sensor_msgs::PointCloud2ConstPtr &_laserClou
 	mBuf.unlock();
 } // laserCloudFullResHandler
 
-void gpsHandler(const nav_msgs::Odometry::ConstPtr &_gps)
+void gpsHandler(const sensor_msgs::NavSatFix::ConstPtr &_gps)
 {
     if(useGPS) {
         mBufGPS.lock();
-        gpsBuf.push(_gps);
+        gpsBuf.push(_gps);  
         mBufGPS.unlock();
     }
 } // gpsHandler
 
 void initNoises( void )
 {
-    gtsam::Vector priorNoiseVector6(6);
-    priorNoiseVector6 << 1e-12, 1e-12, 1e-12, 1e-12, 1e-12, 1e-12;
-    priorNoise = noiseModel::Diagonal::Variances(priorNoiseVector6);
+    priorNoise =
+    noiseModel::Diagonal::Variances(
+            (Vector(6) << 1e-2, 1e-2, M_PI * M_PI, 1e8, 1e8, 1e8)
+                    .finished());  // rad*rad, meter*meter
 
     gtsam::Vector odomNoiseVector6(6);
     // odomNoiseVector6 << 1e-4, 1e-4, 1e-4, 1e-4, 1e-4, 1e-4;
@@ -250,16 +346,6 @@ void initNoises( void )
     robustLoopNoise = gtsam::noiseModel::Robust::Create(
                     gtsam::noiseModel::mEstimator::Cauchy::Create(1), // optional: replacing Cauchy by DCS or GemanMcClure is okay but Cauchy is empirically good.
                     gtsam::noiseModel::Diagonal::Variances(robustNoiseVector6) );
-
-    double bigNoiseTolerentToXY = 1000000000.0; // 1e9
-    double gpsAltitudeNoiseScore = 250.0; // if height is misaligned after loop clsosing, use this value bigger
-    gtsam::Vector robustNoiseVector3(3); // gps factor has 3 elements (xyz)
-    robustNoiseVector3 << bigNoiseTolerentToXY, bigNoiseTolerentToXY, gpsAltitudeNoiseScore; // means only caring altitude here. (because LOAM-like-methods tends to be asymptotically flyging)
-    //Needed for dummy GPS noise estimation
-    // robustGPSNoise = gtsam::noiseModel::Robust::Create(
-    //                 gtsam::noiseModel::mEstimator::Cauchy::Create(1), // optional: replacing Cauchy by DCS or GemanMcClure is okay but Cauchy is empirically good.
-    //                 gtsam::noiseModel::Diagonal::Variances(robustNoiseVector3) );
-
 } // initNoises
 
 Pose6D getOdom(nav_msgs::Odometry::ConstPtr _odom)
@@ -389,7 +475,17 @@ void runISAM2opt(void)
     // called when a variable added 
     isam->update(gtSAMgraph, initialEstimate);
     isam->update();
-    
+
+    if (gotAbsMeas == true) {
+        isam->update();
+        isam->update();
+        isam->update();
+        isam->update();
+        isam->update();
+    }
+
+    gotAbsMeas = false;
+
     gtSAMgraph.resize(0);
     initialEstimate.clear();
 
@@ -566,7 +662,7 @@ void process_pg()
                 auto thisGPS = gpsBuf.front();
                 auto thisGPSTime = thisGPS->header.stamp.toSec();
                 if( abs(thisGPSTime - timeLaserOdometry) < eps ) {
-                    currGPS = thisGPS;
+                    currGPS = navSatFixToLCOdometry(thisGPS);
                     hasGPSforThisKF = true; 
                     break;
                 } else {
@@ -599,14 +695,6 @@ void process_pg()
             if( ! isNowKeyFrame ) 
                 continue; 
 
-            //Currently not used. Used for applying offset to navsat messages
-            // if( !gpsOffsetInitialized ) {
-            //     if(hasGPSforThisKF) { // if the very first frame 
-            //         gpsAltitudeInitOffset = currGPS->pose.pose.position.z;
-            //         gpsOffsetInitialized = true;
-            //     } 
-            // }
-
             //
             // Save data and Add consecutive node 
             //
@@ -632,7 +720,7 @@ void process_pg()
                 gtsam::Pose3 poseOrigin = Pose6DtoGTSAMPose3(keyframePoses.at(init_node_idx));
                 // auto poseOrigin = gtsam::Pose3(gtsam::Rot3::RzRyRx(0.0, 0.0, 0.0), gtsam::Point3(0.0, 0.0, 0.0));
 
-                mtxPosegraph.lock();
+                mtxPosegraph.lock();  
                 {
                     // prior factor 
                     gtSAMgraph.add(gtsam::PriorFactor<gtsam::Pose3>(init_node_idx, poseOrigin, priorNoise));
@@ -640,11 +728,9 @@ void process_pg()
                     // runISAM2opt();          
                 }   
                 mtxPosegraph.unlock();
-
                 gtSAMgraphMade = true; 
-
-                cout << "posegraph prior node " << init_node_idx << " added" << endl;
-            } else /* consecutive node (and odom factor) after the prior added */ { // == keyframePoses.size() > 1 
+            } 
+            else if (keyframePoses.size() > 1 ) { // == keyframePoses.size() > 1 
                 gtsam::Pose3 poseFrom = Pose6DtoGTSAMPose3(keyframePoses.at(prev_node_idx));
                 gtsam::Pose3 poseTo = Pose6DtoGTSAMPose3(keyframePoses.at(curr_node_idx));
 
@@ -652,7 +738,7 @@ void process_pg()
                 {
                     // odom factor
                     gtSAMgraph.add(gtsam::BetweenFactor<gtsam::Pose3>(prev_node_idx, curr_node_idx, poseFrom.between(poseTo), odomNoise));
-
+    
                     // gps factor 
 
                     // Check the covariances of GPS (x,y)
@@ -671,9 +757,8 @@ void process_pg()
                         //Add gps correction after few meters. TODO: Create a function for distance
                         if(sqrt(( currGPS->pose.pose.position.x - lastGPS->pose.pose.position.x ) * ( currGPS->pose.pose.position.x - lastGPS->pose.pose.position.x ) 
                             + ( currGPS->pose.pose.position.y - lastGPS->pose.pose.position.y ) * ( currGPS->pose.pose.position.y - lastGPS->pose.pose.position.y )
-                            + ( currGPS->pose.pose.position.z - lastGPS->pose.pose.position.z ) * ( currGPS->pose.pose.position.z - lastGPS->pose.pose.position.z )) > gpsDistThr || firstGPS)
+                            + ( currGPS->pose.pose.position.z - lastGPS->pose.pose.position.z ) * ( currGPS->pose.pose.position.z - lastGPS->pose.pose.position.z )) > gpsDistThr)
                         {
-                            firstGPS = false;
                             float gps_noise_z;
                             // gps_counter++;
                             gtsam::Point3 gpsConstraint;
@@ -689,23 +774,41 @@ void process_pg()
                                 gps_noise_z = 0.01;
                             }
                             gtsam::Vector gps_noise(3);
-
-                            // if(!gps_init)
-                            //     gps_noise << 1e-14, 1e-14, 1e-14;
-                            // else
-
                             
                             gps_noise << currGPS->pose.covariance[0] * gpsScale, currGPS->pose.covariance[7] * gpsScale, gps_noise_z;
                             noiseModel::Diagonal::shared_ptr gps_noise_Model =
                                     noiseModel::Diagonal::Variances(gps_noise);
-                            gtSAMgraph.add(gtsam::GPSFactor(curr_node_idx, gpsConstraint, gps_noise_Model));
-                            cout << "GPS factor added at node " << curr_node_idx << endl;
+                            gtsam::GPSFactor curr_gps_factor = gtsam::GPSFactor(curr_node_idx, gpsConstraint, gps_noise_Model);
+                            if  (keyframeGpsFactor.size() < thrInitGps)
+                            {
+                                //if we get reliable origin point, we adjust the weight of this gps factor to fix the map origin 
+                                if(keyframeGpsFactor.size() == 0) 
+                                {
+                                    gps_noise << currGPS->pose.covariance[0] * 1e-6, currGPS->pose.covariance[7] * 1e-6, gps_noise_z * 1e-6;
+                                    gps_noise_Model =
+                                    noiseModel::Diagonal::Variances(gps_noise);
+                                    curr_gps_factor = gtsam::GPSFactor(curr_node_idx, gpsConstraint, gps_noise_Model);
+                                }
+                                keyframeGpsFactor.push_back(curr_gps_factor);
+                                ROS_INFO("Accumulated gps factor: %d", keyframeGpsFactor.size());
+                            }
+                            else if(!gpsInit)
+                            {
+                                ROS_INFO("Initialize GNSS transform!");
+                                for (int i = 0; i < keyframeGpsFactor.size(); ++i) {
+                                    gtsam::GPSFactor gpsFactor = keyframeGpsFactor.at(i);
+                                    gtSAMgraph.add(gpsFactor);
+                                }
+                                gpsInit = true;
+                                gotAbsMeas = true;
+                            }
+                            else
+                            {
+                                gtSAMgraph.add(curr_gps_factor);
+                                ROS_INFO("GPS factor added at node: %d", curr_node_idx);
+                                gotAbsMeas = true;
+                             }
                             lastGPS = currGPS;
-
-                            // if(gps_counter >= gps_init_thr) {
-                            //     gps_init = true;  
-                            //     ROS_INFO_ONCE("GPS Initialized.");
-                            // }
                         }
                     }
                     initialEstimate.insert(curr_node_idx, poseTo);                
@@ -714,7 +817,7 @@ void process_pg()
                 mtxPosegraph.unlock();
 
                 if(curr_node_idx % 100 == 0)
-                    cout << "posegraph odom node " << curr_node_idx << " added." << endl;
+                    ROS_INFO("Added posegraph odom node: %d", curr_node_idx);
             }
             // if want to print the current graph, use gtSAMgraph.print("\nFactor Graph:\n");
 
@@ -890,7 +993,7 @@ int main(int argc, char **argv)
     nh.param<double>("sc_leaf_size_down", filterSC, 0.4); // Scan Context point cloud downsampling
 
     //GPS Params
-    nh.param<std::string>("gps_topic", gpsTopic, "/mavros/global_position/local"); // Scaling factor to be multiplied with gps Covariance 
+    nh.param<std::string>("gps_topic", gpsTopic, "/mavros/global_position/global"); // Scaling factor to be multiplied with gps Covariance 
     nh.param<bool>("use_gps", useGPS, false); // Covariance threshold for gps measurement to be taken into account (before applying scaling factor)
     nh.param<bool>("use_gps_elevation", useGPSElevation, false); // Scaling factor to be multiplied with gps Covariance 
     nh.param<double>("gps_dist_thr", gpsDistThr, 5.0); // Distance between gps measurements to be implemented in the graph
@@ -903,7 +1006,6 @@ int main(int argc, char **argv)
     nh.param<double>("icp_loop_fitness_score_thr", loopIcpFitnessScoreThreshold, 0.3); // ICP's loop fitness score threshold to accept closing a loop (i.e. registration was successful)
     nh.param<double>("icp_leaf_size_down", filterIcp, 0.2); // ICP's downsampling   
     nh.param<double>("loop_noise_score", loopNoiseScore, 0.8); // Loop Noise
-
 
     ISAM2Params parameters;
     parameters.relinearizeThreshold = 0.01;
@@ -923,7 +1025,7 @@ int main(int argc, char **argv)
 
 	ros::Subscriber subLaserCloudFullRes = nh.subscribe<sensor_msgs::PointCloud2>("/velodyne_cloud_registered_local", 100, laserCloudFullResHandler);
 	ros::Subscriber subLaserOdometry = nh.subscribe<nav_msgs::Odometry>("/aft_mapped_to_init", 100, laserOdometryHandler);
-	ros::Subscriber subGPS = nh.subscribe<nav_msgs::Odometry>(gpsTopic, 100, gpsHandler);
+	ros::Subscriber subGPS = nh.subscribe<sensor_msgs::NavSatFix>(gpsTopic, 100, gpsHandler);
 
 	pubOdomAftPGO = nh.advertise<nav_msgs::Odometry>("/aft_pgo_odom", 100);
 	pubOdomRepubVerifier = nh.advertise<nav_msgs::Odometry>("/repub_odom", 100);

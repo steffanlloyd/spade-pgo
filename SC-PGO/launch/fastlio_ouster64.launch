@@ -25,12 +25,12 @@
     <param name="lidar_type" type="string" value="MID360"/>
 
     <!-- GPS Parameters -->
-    <param name="gps_topic" type="string" value="aaaaaa"/>
+    <param name="gps_topic" type="string" value="/mavros/global_position/local"/>
     <param name="use_gps" type="bool" value="false"/>                 
     <param name="use_gps_elevation" type="bool" value="false"/>   
-    <param name="gps_dist_thr" type="double" value="10.0"/>                  <!-- Distance between gps measurements to be implemented in the graph-->
-    <param name="gps_cov_thr" type="double" value="20.0"/>                   <!-- Covariance threshold for gps measurement to be taken into account (before applying scaling factor)-->
-    <param name="gps_scale" type="double" value="28.0"/>                     <!-- Scaling factor to be multiplied with gps Covariance -->
+    <param name="gps_dist_thr" type="double" value="5.0"/>                  <!-- Distance between gps measurements to be implemented in the graph-->
+    <param name="gps_cov_thr" type="double" value="4.0"/>                   <!-- Covariance threshold for gps measurement to be taken into account (before applying scaling factor)-->
+    <param name="gps_scale" type="double" value="1.0"/>                     <!-- Scaling factor to be multiplied with gps Covariance -->
 
     <!-- ICP Parameters (registration when closing loop)-->
     <param name="icp_num_keyframes_old" type="double" value="10"/>           <!-- Number of keyframes to be kept for the submap of the old keyframe of the loop -->
