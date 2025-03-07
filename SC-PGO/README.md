@@ -41,7 +41,7 @@
     source devel/setup.bash
     roslaunch aloam_velodyne fastlio_mid360.launch #(or another launch file of your preference) 
 ```
-- After acquiring the data, you must see within your "save_directory" a "Scans" folder and the three following files "odom_poses.txt", "optimized_poses.txt", and "times.txt". Within the utils/python folder you will find the "makeMergedMap.py" file which is the file that will help you register the individual scans to the optimized poses and merge them into a single pcd file.
+- After acquiring the data, you must see within your "save_directory" a "Scans" folder and the three following files "odom_poses.txt", "optimized_poses.txt", and "times.txt". Within the utils/python folder you will find the "makeMergedMap.py" file which will help you register the individual scans to the optimized poses and merge them into a single pcd file.
 
 ## Future work
 Replace the icp for fine registration with a global registration algorithm like TEASER++ (https://github.com/MIT-SPARK/TEASER-plusplus_) to precisely register the desired scans when closing a loop.
