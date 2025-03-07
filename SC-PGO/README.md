@@ -29,12 +29,14 @@
 ## How to use? 
 - First, install the above mentioned dependencies. 
 - Second, read the desired launch file (e.g. fastlio_mid360.launch) and familiarize with algorithm's parameters (explanations are provided within the file). Also modify the "save_directory" parameter to point to a directory of your preference where all the  output data will be saved.
-- To run the package:
+- To run the package (*of course you also need to run your LIO module):
 ```
     mkdir -p ~/my_ws/src
     cd ~/my_ws/src
     git clone git@gitlab.eclipse.org:eclipse-research-labs/spade-project/opencall-1/olympian/vertliner-spade.git
-    cd ..
+    cd vertliner-spade
+    git checkout devSLAM
+    cd ../..
     catkin_make
     source devel/setup.bash
     roslaunch aloam_velodyne fastlio_mid360.launch #(or another launch file of your preference) 
