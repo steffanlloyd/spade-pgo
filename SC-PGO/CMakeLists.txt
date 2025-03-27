@@ -22,7 +22,7 @@ find_package(catkin REQUIRED COMPONENTS
 #find_package(Eigen3 REQUIRED)
 find_package(PCL REQUIRED)
 find_package(OpenCV REQUIRED)
-find_package(Ceres REQUIRED)
+# find_package(Ceres REQUIRED)
 
 find_package(OpenMP REQUIRED)
 find_package(GTSAM REQUIRED QUIET)
@@ -31,7 +31,7 @@ include_directories(
   include
 	${catkin_INCLUDE_DIRS} 
 	${PCL_INCLUDE_DIRS}
-  ${CERES_INCLUDE_DIRS}
+  # ${CERES_INCLUDE_DIRS}
   ${OpenCV_INCLUDE_DIRS}
   ${GTSAM_INCLUDE_DIR}
   /usr/include/GeographicLib
@@ -44,14 +44,14 @@ catkin_package(
 )
 
 
-add_executable(ascanRegistration src/scanRegistration.cpp)
-target_link_libraries(ascanRegistration ${catkin_LIBRARIES} ${PCL_LIBRARIES})
+# add_executable(ascanRegistration src/scanRegistration.cpp)
+# target_link_libraries(ascanRegistration ${catkin_LIBRARIES} ${PCL_LIBRARIES})
 
-add_executable(alaserOdometry src/laserOdometry.cpp)
-target_link_libraries(alaserOdometry ${catkin_LIBRARIES} ${PCL_LIBRARIES} ${CERES_LIBRARIES})
+# add_executable(alaserOdometry src/laserOdometry.cpp)
+# target_link_libraries(alaserOdometry ${catkin_LIBRARIES} ${PCL_LIBRARIES} ${CERES_LIBRARIES})
 
-add_executable(alaserMapping src/laserMapping.cpp)
-target_link_libraries(alaserMapping ${catkin_LIBRARIES} ${PCL_LIBRARIES} ${CERES_LIBRARIES})
+# add_executable(alaserMapping src/laserMapping.cpp)
+# target_link_libraries(alaserMapping ${catkin_LIBRARIES} ${PCL_LIBRARIES} ${CERES_LIBRARIES})
 
 add_executable(alaserPGO 
   src/laserPosegraphOptimization.cpp
@@ -61,14 +61,35 @@ target_compile_options(alaserPGO
   PRIVATE ${OpenMP_CXX_FLAGS}
 )
 target_link_libraries(alaserPGO 
-  ${catkin_LIBRARIES} ${PCL_LIBRARIES} ${CERES_LIBRARIES}
+  ${catkin_LIBRARIES} ${PCL_LIBRARIES}
   ${OpenMP_CXX_FLAGS}
   gtsam
   Geographic
 )
 
-add_executable(kittiHelper src/kittiHelper.cpp)
-target_link_libraries(kittiHelper ${catkin_LIBRARIES} ${PCL_LIBRARIES} ${OpenCV_LIBS})
+
+add_executable(alaserPGO_old 
+  src/laserPosegraphOptimization_old.cpp
+  include/scancontext/Scancontext.cpp
+)
+target_compile_options(alaserPGO_old 
+  PRIVATE ${OpenMP_CXX_FLAGS}
+)
+target_link_libraries(alaserPGO_old 
+  ${catkin_LIBRARIES} ${PCL_LIBRARIES}
+  ${OpenMP_CXX_FLAGS}
+  gtsam
+  Geographic
+)
+
+# Add the visualizeICP node for debugging ICP in an isolated environment
+add_executable(visualizeICP src/visualizeICP.cpp)
+target_link_libraries(visualizeICP ${catkin_LIBRARIES} ${PCL_LIBRARIES}
+${OpenMP_CXX_FLAGS}
+gtsam)
+
+# add_executable(kittiHelper src/kittiHelper.cpp)
+# target_link_libraries(kittiHelper ${catkin_LIBRARIES} ${PCL_LIBRARIES} ${OpenCV_LIBS})
 
 
 

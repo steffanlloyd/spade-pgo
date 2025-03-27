@@ -3,29 +3,34 @@ import sys
 import time 
 import copy 
 from io import StringIO
-
+import argparse
 import pypcd # for the install, use this command: python3.x (use your python ver) -m pip install --user git+https://github.com/DanielPollithy/pypcd.git
 from pypcd import pypcd
-
 import numpy as np
 from numpy import linalg as LA
-
 import open3d as o3d
-
 from pypcdMyUtils import * 
 
-jet_table = np.load('jet_table.npy')
-bone_table = np.load('bone_table.npy')
+script_dir = os.path.dirname(os.path.realpath(__file__))
+jet_table = np.load(os.path.join(script_dir, 'jet_table.npy'))
+bone_table = np.load(os.path.join(script_dir, 'bone_table.npy'))
 
 color_table = jet_table
 color_table_len = color_table.shape[0]
+parser = argparse.ArgumentParser()
+parser.add_argument("-i", "--input", help="Input directory", required=True)
+args = parser.parse_args()
 
 
 ##########################
 # User only consider this block
 ##########################
+data_dir = args.input
+# Make sure data_dir ends with a '/'
+if not data_dir.endswith('/'):
+    data_dir += '/'
 
-data_dir = "/home/john/SLAM_Spade/src/FAST_LIO_SLAM/SC-PGO/Data/" # should end with / 
+# data_dir = "/home/john/SLAM_Spade/src/FAST_LIO_SLAM/SC-PGO/Data/" # should end with / 
 #scan_idx_range_to_stack = [0, 4019] # if you want a whole map, use[0, len(scan_files)] 
 node_skip = 1
 
@@ -86,7 +91,7 @@ for node_idx in range(len(scan_files)):
         continue
 
     nodes_count = nodes_count + 1
-    if( nodes_count % node_skip is not 0): 
+    if( nodes_count % node_skip != 0): 
         if(node_idx is not scan_idx_range_to_stack[0]): # to ensure the vis init 
             continue
 

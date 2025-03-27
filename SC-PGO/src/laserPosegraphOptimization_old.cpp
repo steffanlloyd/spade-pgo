@@ -16,13 +16,13 @@
 #include <pcl/common/common.h>
 #include <pcl/common/transforms.h>
 #include <pcl/filters/extract_indices.h>
+#include <pcl/registration/icp.h>
 #include <pcl/io/pcd_io.h>
 #include <pcl/filters/filter.h>
 #include <pcl/filters/voxel_grid.h>
 #include <pcl/octree/octree_pointcloud_voxelcentroid.h>
 #include <pcl/filters/crop_box.h> 
 #include <pcl_conversions/pcl_conversions.h>
-#include <pcl/registration/icp.h>
 #include <pcl/registration/gicp.h>
 #include <pcl/registration/ndt.h>
 
@@ -36,8 +36,6 @@
 #include <nav_msgs/Path.h>
 #include <geometry_msgs/PoseStamped.h>
 #include <sensor_msgs/NavSatFix.h>
-#include <visualization_msgs/Marker.h>
-#include <visualization_msgs/MarkerArray.h>
 
 #include <eigen3/Eigen/Dense>
 
@@ -74,7 +72,7 @@ using std::endl;
 double keyframeMeterGap;
 double keyframeDegGap, keyframeRadGap;
 double translationAccumulated = 1000000.0; // large value means must add the first given frame.
-double rotationAccumulated = 1000000.0; // large value means must add the first given frame.
+double rotaionAccumulated = 1000000.0; // large value means must add the first given frame.
 
 bool isNowKeyFrame = false; 
 
@@ -85,11 +83,8 @@ gtsam::Pose3 T_odom_to_gps;
 std::queue<nav_msgs::Odometry::ConstPtr> odometryBuf;
 std::queue<sensor_msgs::PointCloud2ConstPtr> fullResBuf;
 std::queue<sensor_msgs::NavSatFix::ConstPtr> gpsBuf;
-std::queue<std::pair<int, int> > loopClosureCandidateBuf;
-std::vector<std::pair<int, int>> loopClosureIdsTested;
-std::vector<std::pair<int, int>> loopClosureIdsAdded;
+std::queue<std::pair<int, int> > scLoopICPBuf;
 
-// SL (Q): what is mBuf a mutex for?
 std::mutex mBuf;
 std::mutex mBufGPS;
 std::mutex mKF;
@@ -144,7 +139,6 @@ bool useGPSElevation;
 double gpsDistThr;
 double gpsCovThr;
 double gpsScale;
-double gpsScaleZ;
 double filterSC;
 u_int8_t thrInitGps = 20;
 bool gpsInit = false;
@@ -152,29 +146,18 @@ bool firstGPS = true;
 GeographicLib::LocalCartesian geoConverter;
 
 //ICP params (loop closing)
-std::string loopClosureMethod;
 int numHistKeyframesIcpOld, numHistKeyframesIcpCurr;
 double loopIcpFitnessScoreThreshold;
 double filterIcp;
 double loopNoiseScore;
-double loopClosureNoiseScale;
-double ICPMaxCorrespondenceDistance;
-int ICPRANSACIterations;
-bool ICPSavePointclouds;
 
-int nearKFProcessedId = 0;
-int lcMinStepSeperation;
-double lcDistanceThreshold;
-double lcDistanceThreshold2;
-
-bool triggerExtraGraphOptimization = false;
+bool gotAbsMeas = false;
 
 std::string gpsTopic;
 
 ros::Publisher pubMapAftPGO, pubOdomAftPGO, pubPathAftPGO;   
 ros::Publisher pubLoopScanLocal, pubLoopSubmapLocal;
 ros::Publisher pubOdomRepubVerifier;
-ros::Publisher pubMarker;
 
 std::string save_directory;
 std::string pgKITTIformat, pgScansDirectory;
@@ -185,18 +168,6 @@ std::string padZeros(int val, int num_digits = 6) {
   std::ostringstream out;
   out << std::internal << std::setfill('0') << std::setw(num_digits) << val;
   return out.str();
-}
-
-// Function to compute Euclidean distance (squared) between two poses
-double euclideanDistance2(const Pose6D& p1, const Pose6D& p2) {
-    return  (p1.x - p2.x) * (p1.x - p2.x) +
-            (p1.y - p2.y) * (p1.y - p2.y) +
-            (p1.z - p2.z) * (p1.z - p2.z);
-}
-
-// Function to compute Euclidean distance between two poses
-double euclideanDistance(const Pose6D& p1, const Pose6D& p2) {
-    return std::sqrt(euclideanDistance2(p1, p2));
 }
 
 gtsam::Pose3 Pose6DtoGTSAMPose3(const Pose6D& p)
@@ -247,7 +218,6 @@ void saveOptimizedVerticesKITTIformat(gtsam::Values _estimates, std::string _fil
     }
 }
 
-// SL (Q): How do I use this?
 nav_msgs::Odometry::ConstPtr navSatFixToUTMOdometry(const sensor_msgs::NavSatFix::ConstPtr& nav_sat_fix)
 {
     // For UTM
@@ -293,7 +263,6 @@ nav_msgs::Odometry::ConstPtr navSatFixToUTMOdometry(const sensor_msgs::NavSatFix
     return nav_msgs::Odometry::ConstPtr(odom_ptr);
 }
 
-// SL (Q): What if this "first" navsatfix has error? Is the whole map shifted, or is that fixed afterwards by the graph somehow?
 nav_msgs::Odometry::ConstPtr navSatFixToLCOdometry(const sensor_msgs::NavSatFix::ConstPtr& nav_sat_fix)
 {
     if (firstGPS)
@@ -377,7 +346,6 @@ void initNoises( void )
                     gtsam::noiseModel::Diagonal::Variances(robustNoiseVector6) );
 } // initNoises
 
-// SL: Why using roll pitch yaw instead of quaternion?
 Pose6D getOdom(nav_msgs::Odometry::ConstPtr _odom)
 {
     auto tx = _odom->pose.pose.position.x;
@@ -427,51 +395,6 @@ pcl::PointCloud<PointType>::Ptr local2global(const pcl::PointCloud<PointType>::P
     return cloudOut;
 }
 
-
-void publish_lc_markers()
-{
-    visualization_msgs::MarkerArray markerArray;
-
-    for (size_t i = 0; i < loopClosureIdsAdded.size(); ++i){
-        // Assume pubMarker is a ros::Publisher advertising on, e.g., "/loop_closure_marker"
-        visualization_msgs::Marker marker;
-        marker.header.frame_id = "camera_init"; // or the frame that your keyframe positions are in
-        marker.header.stamp = ros::Time::now();
-        marker.ns = "loop_closures";
-        marker.id = i; // You can assign different IDs if you want to publish multiple markers
-        marker.type = visualization_msgs::Marker::LINE_LIST;
-        marker.action = visualization_msgs::Marker::ADD;
-
-        // Set the line width
-        marker.scale.x = 0.3; // Adjust this value for the desired line thickness
-
-        // Set the color (red in this example)
-        marker.color.r = 1.0;
-        marker.color.g = 0.0;
-        marker.color.b = 0.0;
-        marker.color.a = 1.0;
-
-        geometry_msgs::Point pointA, pointB;
-        // Fill in the coordinates of the first keyframe (e.g., from keyframePosesUpdated[prev_idx])
-        pointA.x = keyframePosesUpdated[loopClosureIdsAdded[i].first].x;
-        pointA.y = keyframePosesUpdated[loopClosureIdsAdded[i].first].y;
-        pointA.z = keyframePosesUpdated[loopClosureIdsAdded[i].first].z;
-
-        // Fill in the coordinates of the current keyframe (e.g., from keyframePosesUpdated[curr_idx])
-        pointB.x = keyframePosesUpdated[loopClosureIdsAdded[i].second].x;
-        pointB.y = keyframePosesUpdated[loopClosureIdsAdded[i].second].y;
-        pointB.z = keyframePosesUpdated[loopClosureIdsAdded[i].second].z;
-
-        // For LINE_LIST, add each pair of points consecutively
-        marker.points.push_back(pointA);
-        marker.points.push_back(pointB);
-        
-        markerArray.markers.push_back(marker);
-    }
-    // Publish it
-    pubMarker.publish(markerArray);
-} // publish_lc_markers()
-
 void pubPath( void )
 {
     // pub odom and path 
@@ -480,13 +403,9 @@ void pubPath( void )
     pathAftPGO.header.frame_id = "camera_init";
     mKF.lock(); 
     // for (int node_idx=0; node_idx < int(keyframePosesUpdated.size()) - 1; node_idx++) // -1 is just delayed visualization (because sometimes mutexed while adding(push_back) a new one)
-
-    // SL: Loop through all elements of keyframePosesUpdated, transform them into a 
-    // a list of geometry_msgs::PoseStamped, and store into a an array in a nav::messages/Path
-    // message
     for (int node_idx=0; node_idx < recentIdxUpdated; node_idx++) // -1 is just delayed visualization (because sometimes mutexed while adding(push_back) a new one)
     {
-        const Pose6D& pose_est = keyframePosesUpdated.at(node_idx); // updated poses
+        const Pose6D& pose_est = keyframePosesUpdated.at(node_idx); // upodated poses
         // const gtsam::Pose3& pose_est = isamCurrentEstimate.at<gtsam::Pose3>(node_idx);
 
         nav_msgs::Odometry odomAftPGOthis;
@@ -508,35 +427,21 @@ void pubPath( void )
         pathAftPGO.poses.push_back(poseStampAftPGO);
     }
     mKF.unlock(); 
-
-    // SL: Publish the most recent odometry pose
-    pubOdomAftPGO.publish(odomAftPGO); // last pose
-    // SL: Publish the last pose 
+    pubOdomAftPGO.publish(odomAftPGO); // last pose 
     pubPathAftPGO.publish(pathAftPGO); // poses 
 
-    // SL: Updates the transform
-    // Only send a transform if the timestamp has changed.
     static tf::TransformBroadcaster br;
-    static ros::Time last_tf_time;
-    if (odomAftPGO.header.stamp != last_tf_time)
-    {
-        last_tf_time = odomAftPGO.header.stamp;
-        
-        tf::Transform transform;
-        tf::Quaternion q;
-        transform.setOrigin(tf::Vector3(odomAftPGO.pose.pose.position.x, odomAftPGO.pose.pose.position.y, odomAftPGO.pose.pose.position.z));
-        q.setW(odomAftPGO.pose.pose.orientation.w);
-        q.setX(odomAftPGO.pose.pose.orientation.x);
-        q.setY(odomAftPGO.pose.pose.orientation.y);
-        q.setZ(odomAftPGO.pose.pose.orientation.z);
-        transform.setRotation(q);
-        br.sendTransform(tf::StampedTransform(transform, odomAftPGO.header.stamp, "camera_init", "/aft_pgo"));
-    }
-
-    publish_lc_markers();
+    tf::Transform transform;
+    tf::Quaternion q;
+    transform.setOrigin(tf::Vector3(odomAftPGO.pose.pose.position.x, odomAftPGO.pose.pose.position.y, odomAftPGO.pose.pose.position.z));
+    q.setW(odomAftPGO.pose.pose.orientation.w);
+    q.setX(odomAftPGO.pose.pose.orientation.x);
+    q.setY(odomAftPGO.pose.pose.orientation.y);
+    q.setZ(odomAftPGO.pose.pose.orientation.z);
+    transform.setRotation(q);
+    br.sendTransform(tf::StampedTransform(transform, odomAftPGO.header.stamp, "camera_init", "/aft_pgo"));
 } // pubPath
 
-// Updates the keyFramesPoses with the isam estimate
 void updatePoses(void)
 {
     mKF.lock(); 
@@ -565,16 +470,20 @@ void updatePoses(void)
 
 void runISAM2opt(void)
 {
-    // Add all new graph factors to the ISAM optimizer
+    // called when a variable added 
     isam->update(gtSAMgraph, initialEstimate);
     isam->update();
 
-    if (triggerExtraGraphOptimization == true) {
-        for(int i=0; i<5; i++) isam->update();
+    if (gotAbsMeas == true) {
+        isam->update();
+        isam->update();
+        isam->update();
+        isam->update();
+        isam->update();
     }
-    triggerExtraGraphOptimization = false;
 
-    // SL: Clears the graph since all the factors have already been added to ISAM optimizer
+    gotAbsMeas = false;
+
     gtSAMgraph.resize(0);
     initialEstimate.clear();
 
@@ -614,9 +523,7 @@ void loopFindNearKeyframesCloud( pcl::PointCloud<PointType>::Ptr& nearKeyframes,
     nearKeyframes->clear();   
     for (int i = -submap_size; i <= submap_size; ++i) {
         int keyNear = key + i;
-        // if (keyNear < 0 || keyNear >= int(keyframeLaserClouds.size()) )
-        //     continue;
-        if (keyNear < 0 || keyNear >= recentIdxUpdated )
+        if (keyNear < 0 || keyNear >= int(keyframeLaserClouds.size()) )
             continue;
 
         mKF.lock(); 
@@ -634,160 +541,101 @@ void loopFindNearKeyframesCloud( pcl::PointCloud<PointType>::Ptr& nearKeyframes,
     *nearKeyframes = *cloud_temp;
 } // loopFindNearKeyframesCloud
 
-// SL: Compute the relative pose between two key frame indicies 
-// SL: Modified to return the noise model as well   
-std::optional<std::pair<gtsam::Pose3, gtsam::noiseModel::Base::shared_ptr>> doICPVirtualRelative( int _loop_kf_idx, int _curr_kf_idx )
+    
+std::optional<gtsam::Pose3> doICPVirtualRelative( int _loop_kf_idx, int _curr_kf_idx )
 {
-    // SL: Define point clouds
-    pcl::PointCloud<PointType>::Ptr currKeyframeCloud(new pcl::PointCloud<PointType>());
+    // parse pointclouds
+    pcl::PointCloud<PointType>::Ptr cureKeyframeCloud(new pcl::PointCloud<PointType>());
     pcl::PointCloud<PointType>::Ptr targetKeyframeCloud(new pcl::PointCloud<PointType>());     
-
-    // Assemble point clouds from frames around potential key frames indicies
-    loopFindNearKeyframesCloud(currKeyframeCloud, _curr_kf_idx, numHistKeyframesIcpCurr); // use same root of loop kf idx 
+    loopFindNearKeyframesCloud(cureKeyframeCloud, _curr_kf_idx, numHistKeyframesIcpCurr); // use same root of loop kf idx 
     loopFindNearKeyframesCloud(targetKeyframeCloud, _loop_kf_idx, numHistKeyframesIcpOld);   
 
-    // loop verification
-    // SL (Q): Whether or not to spend time publishing these frames should be a ROS parameter 
-    sensor_msgs::PointCloud2 currKeyframeCloudMsg;   
-    pcl::toROSMsg(*currKeyframeCloud, currKeyframeCloudMsg);
-    currKeyframeCloudMsg.header.frame_id = "camera_init";     
-    pubLoopScanLocal.publish(currKeyframeCloudMsg);
+    // loop verification         
+    sensor_msgs::PointCloud2 cureKeyframeCloudMsg;   
+    pcl::toROSMsg(*cureKeyframeCloud, cureKeyframeCloudMsg);
+    cureKeyframeCloudMsg.header.frame_id = "camera_init";     
+    pubLoopScanLocal.publish(cureKeyframeCloudMsg);
 
     sensor_msgs::PointCloud2 targetKeyframeCloudMsg;
     pcl::toROSMsg(*targetKeyframeCloud, targetKeyframeCloudMsg);
     targetKeyframeCloudMsg.header.frame_id = "camera_init";
     pubLoopSubmapLocal.publish(targetKeyframeCloudMsg);
 
-    // Save the two point clouds to PCD files
-    // Save the two point clouds using filenames that reflect their keyframe indices
-    if(ICPSavePointclouds){
-        std::stringstream curr_filename, loop_filename;
-        curr_filename << save_directory << "loop_closure_pcd/" << "current_kf_" << _curr_kf_idx << "-" << _loop_kf_idx << ".pcd";
-        loop_filename << save_directory << "loop_closure_pcd/" << "loop_kf_" << _curr_kf_idx << "-" << _loop_kf_idx << ".pcd";
-    
-        pcl::io::savePCDFileASCII(curr_filename.str(), *currKeyframeCloud);
-        pcl::io::savePCDFileASCII(loop_filename.str(), *targetKeyframeCloud);
-    }
+    // ------------------------   
+    //  Coarse ICP
+    // ------------------------
+    // pcl::IterativeClosestPoint<PointType, PointType> icp_coarse;
+    // icp_coarse.setMaxCorrespondenceDistance(30.0);   // smaller threshold for fine
+    // icp_coarse.setMaximumIterations(100);
+    // icp_coarse.setTransformationEpsilon(1e-6);
+    // icp_coarse.setEuclideanFitnessEpsilon(1e-6);
+
+    // icp_coarse.setInputSource(cureKeyframeCloud);
+    // icp_coarse.setInputTarget(targetKeyframeCloud);
+
+    // pcl::PointCloud<PointType>::Ptr coarse_result(new pcl::PointCloud<PointType>());   
+    // // If you have a known initial guess (e.g., from the yaw difference or prior pose difference),
+    // // pass it in as the second argument to align(). 
+    // // Otherwise, pass an identity matrix or omit it.
+    // icp_coarse.align(*coarse_result);
+
+    // if (!icp_coarse.hasConverged()) 
+    // {
+    //     ROS_WARN("[SC loop] Coarse ICP did not converge.");
+    //     return std::nullopt;
+    // }
 
     // ------------------------
     //  Fine ICP
     // ------------------------
-    // SL (Q): Did you try NDT by chance? Did it work better/worse?
+    pcl::IterativeClosestPoint<PointType, PointType> icp;
+    icp.setMaxCorrespondenceDistance(130.0);   // smaller threshold for fine
+    icp.setMaximumIterations(100);
+    icp.setTransformationEpsilon(1e-6);
+    icp.setEuclideanFitnessEpsilon(1e-6);
+    icp.setRANSACIterations(0);
 
-    bool isConverged;
-    float fitnessScore;
-    Eigen::Affine3f correctionLidarFrame;
-    
-    // Get the current time before ICP computation
-    ros::Time icp_start_time = ros::Time::now();
-    
-    if(loopClosureMethod == "gicp"){
+    icp.setInputSource(cureKeyframeCloud);
+    icp.setInputTarget(targetKeyframeCloud);
 
-        pcl::GeneralizedIterativeClosestPoint<PointType, PointType> gicp;
-        gicp.setMaxCorrespondenceDistance(ICPMaxCorrespondenceDistance);   // smaller threshold for fine
-        gicp.setMaximumIterations(40);
-        gicp.setTransformationEpsilon(1e-7);
-        gicp.setEuclideanFitnessEpsilon(1e-7);
-        gicp.setRANSACIterations(ICPRANSACIterations); // SL (Q): Why no ransac? Could help!
-    
-        gicp.setInputSource(currKeyframeCloud);
-        gicp.setInputTarget(targetKeyframeCloud);
-    
-        pcl::PointCloud<PointType>::Ptr fine_result(new pcl::PointCloud<PointType>());
-        gicp.align(*fine_result);
+    pcl::PointCloud<PointType>::Ptr fine_result(new pcl::PointCloud<PointType>());
 
-        isConverged = gicp.hasConverged();
-        fitnessScore = gicp.getFitnessScore();
-        correctionLidarFrame = gicp.getFinalTransformation();
-
-    }else if(loopClosureMethod == "icp"){
-
-        pcl::IterativeClosestPoint<PointType, PointType> icp;
-        icp.setMaxCorrespondenceDistance(ICPMaxCorrespondenceDistance);   // smaller threshold for fine
-        icp.setMaximumIterations(40);
-        icp.setTransformationEpsilon(1e-7);
-        icp.setEuclideanFitnessEpsilon(1e-7);
-        icp.setRANSACIterations(ICPRANSACIterations); // SL (Q): Why no ransac? Could help!
-    
-        icp.setInputSource(currKeyframeCloud);
-        icp.setInputTarget(targetKeyframeCloud);
-    
-        pcl::PointCloud<PointType>::Ptr fine_result(new pcl::PointCloud<PointType>());
-        icp.align(*fine_result);
-
-        isConverged = icp.hasConverged();
-        fitnessScore = icp.getFitnessScore();
-        correctionLidarFrame = icp.getFinalTransformation();
-
-    }else if(loopClosureMethod == "ndt"){
-
-        pcl::NormalDistributionsTransform<PointType, PointType> ndt;
-        ndt.setResolution(0.6); // Adjust resolution (in meters) as needed
-        ndt.setMaxCorrespondenceDistance(ICPMaxCorrespondenceDistance);   // Maximum correspondence distance
-        ndt.setMaximumIterations(40);
-        ndt.setTransformationEpsilon(1e-7);
-        ndt.setEuclideanFitnessEpsilon(1e-7);
-    
-        ndt.setInputSource(currKeyframeCloud);
-        ndt.setInputTarget(targetKeyframeCloud);
-    
-        pcl::PointCloud<PointType>::Ptr ndt_result(new pcl::PointCloud<PointType>());
-        ndt.align(*ndt_result);
-        
-        isConverged = ndt.hasConverged();
-        fitnessScore = ndt.getFitnessScore();
-        correctionLidarFrame = ndt.getFinalTransformation();
-
-    }else{
-        ROS_ERROR("Invalid loopClosureMethod: %s. Expected \"icp\", \"gicp\", or \"ndt\". Skipping loop closure.", loopClosureMethod.c_str());
-        return std::nullopt;  // Trigger error and exit the function early
-    }
-
-    if (!isConverged || fitnessScore > loopIcpFitnessScoreThreshold) {
-        ROS_WARN("[SC loop] ICP fitness test failed (%.4g > %.4g). Not adding SC loop between %d and %d. ICP runtime: %.3g ms.", fitnessScore, loopIcpFitnessScoreThreshold, _loop_kf_idx, _curr_kf_idx, (ros::Time::now() - icp_start_time).toSec()*1e3);
+    // Use the coarse ICP’s final transformation as the initial guess
+    //icp.align(*fine_result, icp_coarse.getFinalTransformation());
+    icp.align(*fine_result);
+ 
+    if (icp.hasConverged() == false || icp.getFitnessScore() > loopIcpFitnessScoreThreshold) {
+        std::cout << "[SC loop] ICP fitness test failed (" << icp.getFitnessScore() << " > " << loopIcpFitnessScoreThreshold << "). Reject this SC loop." << std::endl;
         return std::nullopt;
     } else {
-        ROS_INFO("[SC loop] ICP fitness test passed (%.4g < %.4g). Adding SC loop between %d and %d. ICP runtime: %.3g ms.", fitnessScore, loopIcpFitnessScoreThreshold, _loop_kf_idx, _curr_kf_idx, (ros::Time::now() - icp_start_time).toSec()*1e3);
+        std::cout << "[SC loop] ICP fitness test passed (" << icp.getFitnessScore() << " < " << loopIcpFitnessScoreThreshold << "). Add this SC loop." << std::endl;
     }
 
     // Get pose transformation
     float x, y, z, roll, pitch, yaw;
+    Eigen::Affine3f correctionLidarFrame;
+    correctionLidarFrame = icp.getFinalTransformation();
     pcl::getTranslationAndEulerAngles (correctionLidarFrame, x, y, z, roll, pitch, yaw);
     gtsam::Pose3 poseFrom = Pose3(Rot3::RzRyRx(roll, pitch, yaw), Point3(x, y, z));
     gtsam::Pose3 poseTo = Pose3(Rot3::RzRyRx(0.0, 0.0, 0.0), Point3(0.0, 0.0, 0.0));
-    // SL (Q): This is equivalent to gtsam::Pose3 poseTo = Pose3::identity();
 
-    // Compute the noise model proportional to the fitness score squared
-    gtsam::Vector robustNoiseVector6(6);
-    robustNoiseVector6 << fitnessScore, fitnessScore, fitnessScore, fitnessScore, fitnessScore, fitnessScore;
-    robustNoiseVector6 *= loopClosureNoiseScale;
-    auto loopNoise = gtsam::noiseModel::Robust::Create(
-                        gtsam::noiseModel::mEstimator::Cauchy::Create(1),
-                        gtsam::noiseModel::Diagonal::Variances(robustNoiseVector6)
-                    );
-
-    // Return both the relative pose and the noise model
-    return std::make_pair(poseFrom.between(poseTo), loopNoise);
+    return poseFrom.between(poseTo);
 } // doICPVirtualRelative
 
 void process_pg()
 {
-    // SL: Start infinite loop
     while(1)
     {
-        // SL: While odometry buffer and laser scan buffer (full res) are not empty.
 		while ( !odometryBuf.empty() && !fullResBuf.empty() )
         {
             //
             // pop and check keyframe is or not  
             // 
-            // SL: Discard odometry measurements older than the first laser scan
 			mBuf.lock();       
             while (!odometryBuf.empty() && odometryBuf.front()->header.stamp.toSec() < fullResBuf.front()->header.stamp.toSec())
                 odometryBuf.pop();
             if (odometryBuf.empty())
             {
-                // If the odometry buffer is now empty, break out of loop and wait more
                 mBuf.unlock();
                 break;
             }
@@ -796,23 +644,17 @@ void process_pg()
             timeLaserOdometry = odometryBuf.front()->header.stamp.toSec();
             timeLaser = fullResBuf.front()->header.stamp.toSec();
             // TODO
-            // SL (Q): What is to do? what is being checked here?
 
-            // SL: Convert the full res laser scan queue item into a point cloud, store it in thisKeyFrame
-            laserCloudFullRes->clear(); // SL (Q): Why are we clearing the full laser cloud? I don't think this variable is actually even used besides this one line.
+            laserCloudFullRes->clear();
             pcl::PointCloud<PointType>::Ptr thisKeyFrame(new pcl::PointCloud<PointType>());
             pcl::fromROSMsg(*fullResBuf.front(), *thisKeyFrame);
             fullResBuf.pop();
 
-            // SL: Convert odometry queue item corresponding to a position and RPY, store in pose_curr
             Pose6D pose_curr = getOdom(odometryBuf.front());
             odometryBuf.pop();
 
-            // SL: Look for a GPS message corresponding to key frame (as determined be eps)
-            // SL: Discard all other prior GPS points
-            // SL: Store 
-            // SL (Q): eps should be a ROS parameter
-            double eps = 0.1; // find a gps topic arrived within eps second 
+            // find nearest gps 
+            double eps = 0.1; // find a gps topioc arrived within eps second 
             mBufGPS.lock();
             while (!gpsBuf.empty()) {
                 auto thisGPS = gpsBuf.front();
@@ -830,26 +672,20 @@ void process_pg()
             mBuf.unlock();
 
             //
-            // Early reject by counting local delta movement (for equi-spreated kf drop)
-            // SL: Decide if should assign this measurement as a key frame, by checking
-            // how much distance has been travelled since the previous keyframe.
-            // SL (Q): If it's not a key frame, is the laser scan discarded? Shouldn't it be merged, somehow?
-            // SL (Q): What is the downside of just having more keyframes?
+            // Early reject by counting local delta movement (for equi-spereated kf drop)
             // 
             odom_pose_prev = odom_pose_curr;
             odom_pose_curr = pose_curr;
-            // SL (Q): Seems like the logic to calculate the distance between poses should be in the diffTransformation function
-            // Then you could have a dedicated function that returns cartesian distance and angular distance
             Pose6D dtf = diffTransformation(odom_pose_prev, odom_pose_curr); // dtf means delta_transform
 
             double delta_translation = sqrt(dtf.x*dtf.x + dtf.y*dtf.y + dtf.z*dtf.z); // note: absolute value. 
             translationAccumulated += delta_translation;
-            rotationAccumulated += (dtf.roll + dtf.pitch + dtf.yaw); // sum just naive approach.  
+            rotaionAccumulated += (dtf.roll + dtf.pitch + dtf.yaw); // sum just naive approach.  
 
-            if( translationAccumulated > keyframeMeterGap || rotationAccumulated > keyframeRadGap ) {
+            if( translationAccumulated > keyframeMeterGap || rotaionAccumulated > keyframeRadGap ) {
                 isNowKeyFrame = true;
                 translationAccumulated = 0.0; // reset 
-                rotationAccumulated = 0.0; // reset 
+                rotaionAccumulated = 0.0; // reset 
             } else {
                 isNowKeyFrame = false;
             }
@@ -857,43 +693,27 @@ void process_pg()
             if( ! isNowKeyFrame ) 
                 continue; 
 
-            // SL (Q): Suggested refactor:
-            //
-            // // Break out of loop if distance travelled is insufficient. Otherwise, reset accumulated travel.
-            // if( translationAccumulated < keyframeMeterGap && rotationAccumulated < keyframeRadGap ) continue;
-            //
-            // translationAccumulated = 0.0; // reset 
-            // rotationAccumulated = 0.0; // reset 
-            
             //
             // Save data and Add consecutive node 
             //
-            // SL: Downsample input point cloud from thisKeyFrame according to voxel
             pcl::PointCloud<PointType>::Ptr thisKeyFrameDS(new pcl::PointCloud<PointType>());
             downSizeFilterScancontext.setInputCloud(thisKeyFrame);
             downSizeFilterScancontext.filter(*thisKeyFrameDS);
 
             mKF.lock(); 
-            // SL: Store downsampled data to vectors of laser clouds, poses, and timestamps
             keyframeLaserClouds.push_back(thisKeyFrameDS);
             keyframePoses.push_back(pose_curr);
             keyframePosesUpdated.push_back(pose_curr); // init
             keyframeTimes.push_back(timeLaserOdometry);
 
-            // SL (Q): What does this line do?
             scManager.makeAndSaveScancontextAndKeys(*thisKeyFrameDS);
 
-            // SL (Q): laserCloudMapPGORedraw doesn't seem to be referenced anywhere else in code. If this line
-            // doesn't do anything, just remove.
             laserCloudMapPGORedraw = true;
             mKF.unlock(); 
 
-            // SL: Get indicies of keyframes (current and previous)
             const int prev_node_idx = keyframePoses.size() - 2; 
             const int curr_node_idx = keyframePoses.size() - 1; // becuase cpp starts with 0 (actually this index could be any number, but for simple implementation, we follow sequential indexing)
-
             if( ! gtSAMgraphMade /* prior node */) {
-                // SL: If graph is not made, initialize it with the origin pose
                 const int init_node_idx = 0; 
                 gtsam::Pose3 poseOrigin = Pose6DtoGTSAMPose3(keyframePoses.at(init_node_idx));
                 // auto poseOrigin = gtsam::Pose3(gtsam::Rot3::RzRyRx(0.0, 0.0, 0.0), gtsam::Point3(0.0, 0.0, 0.0));
@@ -908,9 +728,7 @@ void process_pg()
                 mtxPosegraph.unlock();
                 gtSAMgraphMade = true; 
             } 
-            // SL (Q): Seems like this should just be if, not else if?
             else if (keyframePoses.size() > 1 ) { // == keyframePoses.size() > 1 
-                // SL: If keyframe sizes are large enough, add between factors based on LIO
                 gtsam::Pose3 poseFrom = Pose6DtoGTSAMPose3(keyframePoses.at(prev_node_idx));
                 gtsam::Pose3 poseTo = Pose6DtoGTSAMPose3(keyframePoses.at(curr_node_idx));
 
@@ -942,159 +760,81 @@ void process_pg()
                             float gps_noise_z;
                             // gps_counter++;
                             gtsam::Point3 gpsConstraint;
-                            // SL: Explain what happens if altitude not used?
                             if(useGPSElevation) {
                                 gpsConstraint << currGPS->pose.pose.position.x, currGPS->pose.pose.position.y, currGPS->pose.pose.position.z;
-                                gps_noise_z = currGPS->pose.covariance[14] * gpsScale * gpsScaleZ;
+                                gps_noise_z = currGPS->pose.covariance[14] * gpsScale;
                             }
                             else 
                             {
                                 mtxRecentPose.lock(); //Protect recentOptimizedZ
                                 gpsConstraint << currGPS->pose.pose.position.x, currGPS->pose.pose.position.y, recentOptimizedZ;
                                 mtxRecentPose.unlock();
-                                gps_noise_z = 1e8;
-                                // SL (Q): GPS NOISE Z should be infinite if we don't know it
-                                // SL (Q): How do you know for sure that recentOptimizedZ has been populated, and isn't the default value (0)? 
-                                // SL (Q): Maybe safer to just set z to 0, then set gps_noise_z = 1e10 or something.
+                                gps_noise_z = 0.01;
                             }
                             gtsam::Vector gps_noise(3);
                             
-                            // Build gps noise model and factor
                             gps_noise << currGPS->pose.covariance[0] * gpsScale, currGPS->pose.covariance[7] * gpsScale, gps_noise_z;
                             noiseModel::Diagonal::shared_ptr gps_noise_Model =
                                     noiseModel::Diagonal::Variances(gps_noise);
                             gtsam::GPSFactor curr_gps_factor = gtsam::GPSFactor(curr_node_idx, gpsConstraint, gps_noise_Model);
-                           
-                            // SL: Don't add gps measurements until we've reached at least thrInitGPS valid GPS measurements (default 20)
-                            // If we're below the threshold, just make the factor and add it to the keyframeGpsFactor vector
                             if  (keyframeGpsFactor.size() < thrInitGps)
                             {
-                                // If we get reliable origin point, we adjust the weight of this gps factor to fix the map origin 
+                                //if we get reliable origin point, we adjust the weight of this gps factor to fix the map origin 
                                 if(keyframeGpsFactor.size() == 0) 
                                 {
-                                    // SL (Q): why is gps_noise being redefined? Why are we suddenly scaled by 1e-6?
-                                    // If this is the correct logic, why not:
-                                    // gps_noise *= 1e-6;
                                     gps_noise << currGPS->pose.covariance[0] * 1e-6, currGPS->pose.covariance[7] * 1e-6, gps_noise_z * 1e-6;
                                     gps_noise_Model =
                                     noiseModel::Diagonal::Variances(gps_noise);
                                     curr_gps_factor = gtsam::GPSFactor(curr_node_idx, gpsConstraint, gps_noise_Model);
                                 }
                                 keyframeGpsFactor.push_back(curr_gps_factor);
-                                ROS_DEBUG("Accumulated gps factor: %ld", keyframeGpsFactor.size());
+                                ROS_INFO("Accumulated gps factor: %d", keyframeGpsFactor.size());
                             }
-                            // Otherwise, if there are enough GPS points, but the GPS measurements have not been initialized, go
-                            // through all current keyframe's and add them to the graph
                             else if(!gpsInit)
                             {
                                 ROS_INFO("Initialize GNSS transform!");
-                                for (size_t i = 0; i < keyframeGpsFactor.size(); ++i) {
+                                for (int i = 0; i < keyframeGpsFactor.size(); ++i) {
                                     gtsam::GPSFactor gpsFactor = keyframeGpsFactor.at(i);
                                     gtSAMgraph.add(gpsFactor);
                                 }
                                 gpsInit = true;
-                                triggerExtraGraphOptimization = true;
+                                gotAbsMeas = true;
                             }
-                            // Otherwise, just add the current factor
                             else
                             {
                                 gtSAMgraph.add(curr_gps_factor);
-                                ROS_DEBUG("GPS factor added at node: %d", curr_node_idx);
-                                triggerExtraGraphOptimization = true;
+                                ROS_INFO("GPS factor added at node: %d", curr_node_idx);
+                                gotAbsMeas = true;
                              }
                             lastGPS = currGPS;
-                        } // End GPS measurement valid block (travelled enough distance)
-                    } // End has GPS valid block 
-
-                    // SL (Q): Suggested refactor for block above (makes code more readable and logic clearer).
-                    // odometryDistance would check for nullptr's.
-                    //
-                    // if (hasGPSforThisKF &&
-                    //     currGPS != nullptr &&
-                    //     (currGPS->pose.covariance[0] < gpsCovThr && currGPS->pose.covariance[7] < gpsCovThr) &&
-                    //     odometryDistance(lastGPS, currGPS) > gpsDistThr)
-                    // { 
-                    //     lastGPS = currGPS;
-                    //
-                    //     gtsam::Point3 gpsConstraint(currGPS->pose.pose.position.x, currGPS->pose.pose.position.y, currGPS->pose.pose.position.z);
-                    //     gtsam::Vector gps_noise(3);
-                    //     gps_noise << currGPS->pose.covariance[0] * gpsScale, currGPS->pose.covariance[7] * gpsScale, currGPS->pose.covariance[14] * gpsScale;
-                    //     if(!useGPSElevation){
-                    //         gps_noise(2) = 0.01; // OR 1e10
-                    //         mtxRecentPose.lock(); //Protect recentOptimizedZ
-                    //         gpsConstraint(2) = recentOptimizedZ; // or just 0?
-                    //         mtxRecentPose.unlock();
-                    //     }
-                    //     if(keyframeGPSFactor.size() == 0) gps_noise *= 1e-6;
-                    //     noiseModel::Diagonal::shared_ptr gps_noise_Model = noiseModel::Diagonal::Variances(gps_noise);
-                    //     gtsam::GPSFactor curr_gps_factor = gtsam::GPSFactor(curr_node_idx, gpsConstraint, gps_noise_Model);
-                    //
-                    //     if(gpsInit){
-                    //         gtSAMgraph.add(curr_gps_factor);
-                    //         ROS_INFO("GPS factor added at node: %d", curr_node_idx);
-                    //         triggerExtraGraphOptimization = true;
-                    //     }else if (keyframeGpsFactor.size() < thrInitGPS){
-                    //         keyframeGpsFactor.push_back(curr_gps_factor);
-                    //         ROS_INFO("Accumulated gps factor: %d", keyframeGpsFactor.size());
-                    //     }else{
-                    //         ROS_INFO("Initialize GNSS transform!");
-                    //         for (int i = 0; i < keyframeGpsFactor.size(); ++i) {
-                    //             gtSAMgraph.add(keyframeGpsFactor.at(i));
-                    //         }
-                    //         gpsInit = true;
-                    //         triggerExtraGraphOptimization = true;
-                    //     }
-                    // }
-
-                    // Insert the LIO pose estimate as an initial estimate to the graph
+                        }
+                    }
                     initialEstimate.insert(curr_node_idx, poseTo);                
                     // runISAM2opt();
                 }
                 mtxPosegraph.unlock();
 
-                // if(curr_node_idx % 100 == 0)
-                    // ROS_INFO("Added posegraph odom node: %d", curr_node_idx);
-            } // End if statement that there are more than 1 keyframe, and graph is valid
-
+                if(curr_node_idx % 100 == 0)
+                    ROS_INFO("Added posegraph odom node: %d", curr_node_idx);
+            }
             // if want to print the current graph, use gtSAMgraph.print("\nFactor Graph:\n");
 
             // save utility 
-            // SL: Saves the full resolution scan key frame to a file.
             std::string curr_node_idx_str = padZeros(curr_node_idx);
             pcl::io::savePCDFileBinary(pgScansDirectory + curr_node_idx_str + ".pcd", *thisKeyFrame); // scan 
             pgTimeSaveStream << timeLaser << std::endl; // path 
-        } // End of while loop (while odometry buffer and full res scan buffer are both not empty)
+        }
 
         // ps. 
         // scan context detector is running in another thread (in constant Hz, e.g., 1 Hz)
         // pub path and point cloud in another thread
 
         // wait (must required for running the while loop)
-        // SL (Q): Sleep duration should be a ROS parameter
         std::chrono::milliseconds dura(2);
         std::this_thread::sleep_for(dura);
     }
 } // process_pg
 
-void submitLoopClosureCandidate(int id1, int id2)
-{
-    // Check if have already tested this pair
-    for (const auto& p : loopClosureIdsTested){
-        if ((p.first == id1 && p.second == id2) ||
-            (p.first == id2 && p.second == id1)){
-            ROS_DEBUG("Already detected loop between %d and %d", id1, id2);
-            return;
-        }
-    }
-
-    // Push to ICP buffer and add to tested list
-    mBuf.lock();
-    loopClosureCandidateBuf.emplace(id1, id2);
-    mBuf.unlock();
-    loopClosureIdsTested.emplace_back(id1, id2);
-}
-
-// SL: Use ScanContext to identify potential loop closure keyframe candidates, push them into the loopClosureCandidateBuf queue.
 void performSCLoopClosure(void)
 {
     if( int(keyframePoses.size()) < scManager.NUM_EXCLUDE_RECENT) // do not try too early 
@@ -1102,93 +842,54 @@ void performSCLoopClosure(void)
 
     auto detectResult = scManager.detectLoopClosureID(); // first: nn index, second: yaw diff 
     int SCclosestHistoryFrameID = detectResult.first;
+    if( SCclosestHistoryFrameID != -1 ) { 
+        const int prev_node_idx = SCclosestHistoryFrameID;
+        const int curr_node_idx = keyframePoses.size() - 1; // because cpp starts 0 and ends n-1
+        cout << "Loop detected! - between " << prev_node_idx << " and " << curr_node_idx << "" << endl;
 
-    // Exit if not found anything
-    if( SCclosestHistoryFrameID == -1 ) return;
-
-    // Otherwise, add to buffer
-    submitLoopClosureCandidate(SCclosestHistoryFrameID, keyframePoses.size() - 1);
-
+        mBuf.lock();
+        scLoopICPBuf.push(std::pair<int, int>(prev_node_idx, curr_node_idx));
+        // addding actual 6D constraints in the other thread, icp_calculation.
+        mBuf.unlock();
+    }
 } // performSCLoopClosure
 
-// Add keyframes based on nearby keyframes
-void performNearKFClosure(){
-    
-    while(nearKFProcessedId < recentIdxUpdated){
-
-        // Check every frame, at intervals, for KF that are close.
-        // The interval is half the number of keyframes used in the LC detection
-        for (int j = 0; j < recentIdxUpdated - lcMinStepSeperation; j+= static_cast<int>(numHistKeyframesIcpOld / 2)) {
-            double distance2 = euclideanDistance2(keyframePosesUpdated[j], keyframePosesUpdated[nearKFProcessedId]);
-            if (distance2 < lcDistanceThreshold2) {
-                submitLoopClosureCandidate(j, nearKFProcessedId);
-                ROS_INFO("Added candidate loop closure pairs, distance %.3g m < %.3g m", sqrt(distance2), lcDistanceThreshold);
-            }
-        }
-
-        nearKFProcessedId+=static_cast<int>(numHistKeyframesIcpOld / 2);
-    }
-}
-
-// SL: Identify keyframes that have potential loop closures at a given rate
 void process_lcd(void)
 {
-    // SL (Q): Loop closure frequency should be a ROS param
     float loopClosureFrequency = 1.0; // can change 
     ros::Rate rate(loopClosureFrequency);
     while (ros::ok())
     {
         rate.sleep();
-        // SL (Q): I'm curious how well ScanContext does at identifying loop closures in the forest context. It's design for an urban environment. It matches the highest point in the point cloud in an area. In an urban environment, this works well because features have distinct upper roofs. But, in our context the top of the forest is rarely meausrements, so it may not be reliable. Instead we're just always surrounded by forests. Maybe better to just rely on the LIO position, and detect candidate loop closures as estimated close keyframes? Or use some other metric? E.g. just calculate the distance between each pair of key frames, then find pairs that are nearby as candidates.
         performSCLoopClosure();
-
-        // Try LC based on naive KF distance
-        performNearKFClosure();
+        // performRSLoopClosure(); // TODO
     }
 } // process_lcd
 
-// Compute exact graph factors from identified loop closure frames
 void process_icp(void)
 {
     while(1)
     {
-		while ( !loopClosureCandidateBuf.empty() )
+		while ( !scLoopICPBuf.empty() )
         {
-            if( loopClosureCandidateBuf.size() > 30 ) {
-                ROS_WARN("%ld loop closure candidates waiting... Adjust settings to produce fewer loop closure candidates", loopClosureCandidateBuf.size());
+            if( scLoopICPBuf.size() > 30 ) {
+                ROS_WARN("Too many loop clousre candidates to be ICPed is waiting ... Do process_lcd less frequently (adjust loopClosureFrequency)");
             }
 
             mBuf.lock(); 
-            std::pair<int, int> loop_idx_pair = loopClosureCandidateBuf.front();
-            // SL: We can't process loop closures until the pose has been updated by the graph. Skip
-            // any that are not updated.
-            if(loop_idx_pair.first>=recentIdxUpdated || loop_idx_pair.second>=recentIdxUpdated){
-                mBuf.unlock(); 
-                continue;
-            }else{
-                loopClosureCandidateBuf.pop();
-                mBuf.unlock();
-            }
+            std::pair<int, int> loop_idx_pair = scLoopICPBuf.front();
+            scLoopICPBuf.pop();
+            mBuf.unlock(); 
 
-            // get BetweenFactor between poses (or std::nullopt if doesn't pass test)
             const int prev_node_idx = loop_idx_pair.first;
             const int curr_node_idx = loop_idx_pair.second;
             auto relative_pose_optional = doICPVirtualRelative(prev_node_idx, curr_node_idx);
-
-            // SL: Add between factor to graph if valid
             if(relative_pose_optional) {
-                auto [relative_pose, loopNoise] = relative_pose_optional.value();
-                // gtsam::Pose3 relative_pose = relative_pose_optional.value();
+                gtsam::Pose3 relative_pose = relative_pose_optional.value();
                 mtxPosegraph.lock();
-                gtSAMgraph.add(gtsam::BetweenFactor<gtsam::Pose3>(prev_node_idx, curr_node_idx, relative_pose, loopNoise));
-                triggerExtraGraphOptimization = true;
-                // SL (Q): May want to set triggerExtraGraphOptimization = true here to process the loop closure faster
-                // Although, it might be better to rename the variable as: triggerExtraGraphOptimization
-
+                gtSAMgraph.add(gtsam::BetweenFactor<gtsam::Pose3>(prev_node_idx, curr_node_idx, relative_pose, robustLoopNoise));
                 // runISAM2opt();
                 mtxPosegraph.unlock();
-                // Add to list of added loop closures
-                loopClosureIdsAdded.push_back(std::pair<int, int>(prev_node_idx, curr_node_idx));
             } 
         }
 
@@ -1200,7 +901,6 @@ void process_icp(void)
 
 void process_viz_path(void)
 {
-    // SL (Q): The visualization path rate should be a ROS parameter
     float hz = 10.0; 
     ros::Rate rate(hz);
     while (ros::ok()) {
@@ -1220,17 +920,15 @@ void process_isam(void)
         if( gtSAMgraphMade ) {
             mtxPosegraph.lock();
             runISAM2opt();
-            // cout << "running isam2 optimization ..." << endl;
+            cout << "running isam2 optimization ..." << endl;
             mtxPosegraph.unlock();
 
-            // SL (Q): What is happening here?
             saveOptimizedVerticesKITTIformat(isamCurrentEstimate, pgKITTIformat); // pose
             saveOdometryVerticesKITTIformat(odomKITTIformat); // pose
         }
     }
 }
 
-// SL: Publishes the global map, optimized from the pose graph
 void pubMap(void)
 {
     int SKIP_FRAMES = 2; // sparse map visulalization to save computations 
@@ -1240,8 +938,6 @@ void pubMap(void)
 
     mKF.lock(); 
     // for (int node_idx=0; node_idx < int(keyframePosesUpdated.size()); node_idx++) {
-    // SL (Q): Why not use the line that is commented out above?
-    // SL: Loop through all elements of keyframePosesUpdates, add the local cloud to the global map cloud
     for (int node_idx=0; node_idx < recentIdxUpdated; node_idx++) {
         if(counter % SKIP_FRAMES == 0) {
             *laserCloudMapPGO += *local2global(keyframeLaserClouds[node_idx], keyframePosesUpdated[node_idx]);
@@ -1250,21 +946,17 @@ void pubMap(void)
     }
     mKF.unlock(); 
 
-    // SL: Downsample cloud
     downSizeFilterMapPGO.setInputCloud(laserCloudMapPGO);
     downSizeFilterMapPGO.filter(*laserCloudMapPGO);
 
-    // SL: Publish message
     sensor_msgs::PointCloud2 laserCloudMapPGOMsg;
     pcl::toROSMsg(*laserCloudMapPGO, laserCloudMapPGOMsg);
     laserCloudMapPGOMsg.header.frame_id = "camera_init";
     pubMapAftPGO.publish(laserCloudMapPGOMsg);
 }
 
-// SL: Publish visualization map at a given frequency
 void process_viz_map(void)
 {
-    // SL (Q): vizmapFrequency should be a ROS parameter
     float vizmapFrequency = 0.1; // 0.1 means run onces every 10s
     ros::Rate rate(vizmapFrequency);
     while (ros::ok()) {
@@ -1281,20 +973,14 @@ int main(int argc, char **argv)
 	ros::init(argc, argv, "laserPGO");
 	ros::NodeHandle nh;
 
-    // SL (Q): For all the graph noise parameters, it makes more sense for the "human"
-    // readable parameter (the one inputted as the parameter to ROS) be the standard
-    // deviation, rather than the variance. So it is better to have the input variances be input
-    // standard deviations instead, then square them before you give it to the pose graph.
-    // Just makes it easier to process mentally (2x standard deviation = 2x weight, whereas 2x variance
-    // only gives sqrt(2) more weight).)
 	nh.param<std::string>("save_directory", save_directory, "/"); // pose assignment every k m move 
     pgKITTIformat = save_directory + "optimized_poses.txt";
     odomKITTIformat = save_directory + "odom_poses.txt";
     pgTimeSaveStream = std::fstream(save_directory + "times.txt", std::fstream::out); 
     pgTimeSaveStream.precision(std::numeric_limits<double>::max_digits10);
     pgScansDirectory = save_directory + "Scans/";
-    (void)system((std::string("exec rm -r ") + pgScansDirectory).c_str());
-    (void)system((std::string("mkdir -p ") + pgScansDirectory).c_str());
+    auto unused = system((std::string("exec rm -r ") + pgScansDirectory).c_str());
+    unused = system((std::string("mkdir -p ") + pgScansDirectory).c_str());
 
 	nh.param<double>("keyframe_meter_gap", keyframeMeterGap, 2.0); // pose assignment every k m move 
 	nh.param<double>("keyframe_deg_gap", keyframeDegGap, 10.0); // pose assignment every k deg rot 
@@ -1311,24 +997,13 @@ int main(int argc, char **argv)
     nh.param<double>("gps_dist_thr", gpsDistThr, 5.0); // Distance between gps measurements to be implemented in the graph
     nh.param<double>("gps_cov_thr", gpsCovThr, 4.0); // Covariance threshold for gps measurement to be taken into account (before applying scaling factor)
     nh.param<double>("gps_scale", gpsScale, 1.0); // Scaling factor to be multiplied with gps Covariance 
-    nh.param<double>("gps_scale_z", gpsScaleZ, 1e2); // Scaling factor to be multiplied with gps Covariance (on z axis only, in addition to the gps_scale)
 
     //ICP Loop Params
-    nh.param<std::string>("loop_closure_method", loopClosureMethod, "gicp"); // icp, gicp, or ndt
     nh.param<int>("icp_num_keyframes_old", numHistKeyframesIcpOld, 10); // Number of keyframes point cloud to be included in the submap for icp alignment (old keyframe)
     nh.param<int>("icp_num_keyframes_curr", numHistKeyframesIcpCurr, 3); // Number of keyframes point cloud to be included in the submap for icp alignment (current keyframe)
     nh.param<double>("icp_loop_fitness_score_thr", loopIcpFitnessScoreThreshold, 0.3); // ICP's loop fitness score threshold to accept closing a loop (i.e. registration was successful)
     nh.param<double>("icp_leaf_size_down", filterIcp, 0.2); // ICP's downsampling   
-    nh.param<double>("loop_noise_score", loopNoiseScore, 0.8); // Loop Noise variance
-    nh.param<double>("loop_closure_noise_scale", loopClosureNoiseScale, 1); // Loop Noise variance
-    nh.param<double>("icp_max_correspondence_distance", ICPMaxCorrespondenceDistance, 2); // Loop Noise variance
-    nh.param<int>("icp_ransac_iterations", ICPRANSACIterations, 10); // Loop Noise variance
-    nh.param<bool>("icp_save_pointclouds", ICPSavePointclouds, false); // Loop Noise variance
-
-    nh.param<int>("lc_min_step_seperation", lcMinStepSeperation, 20);
-    nh.param<double>("near_kf_threshold", lcDistanceThreshold, 10); // Loop Noise variance
-    lcDistanceThreshold2 = lcDistanceThreshold*lcDistanceThreshold;
-    
+    nh.param<double>("loop_noise_score", loopNoiseScore, 0.8); // Loop Noise
 
     ISAM2Params parameters;
     parameters.relinearizeThreshold = 0.01;
@@ -1346,7 +1021,6 @@ int main(int argc, char **argv)
 	nh.param<double>("mapviz_filter_size", mapVizFilterSize, 0.4); // pose assignment every k frames 
     downSizeFilterMapPGO.setLeafSize(mapVizFilterSize, mapVizFilterSize, mapVizFilterSize);
 
-    // SL (Q): Should rename this topic listener to something more generic
 	ros::Subscriber subLaserCloudFullRes = nh.subscribe<sensor_msgs::PointCloud2>("/velodyne_cloud_registered_local", 100, laserCloudFullResHandler);
 	ros::Subscriber subLaserOdometry = nh.subscribe<nav_msgs::Odometry>("/aft_mapped_to_init", 100, laserOdometryHandler);
 	ros::Subscriber subGPS = nh.subscribe<sensor_msgs::NavSatFix>(gpsTopic, 100, gpsHandler);
@@ -1359,19 +1033,11 @@ int main(int argc, char **argv)
 	pubLoopScanLocal = nh.advertise<sensor_msgs::PointCloud2>("/loop_scan_local", 100);
 	pubLoopSubmapLocal = nh.advertise<sensor_msgs::PointCloud2>("/loop_submap_local", 100);
 
-    // Make loop closure marker publisher
-    pubMarker = nh.advertise<visualization_msgs::MarkerArray>("loop_closure_markers", 10);
-
-
 	std::thread posegraph_slam {process_pg}; // pose graph construction
 	std::thread lc_detection {process_lcd}; // loop closure detection 
 	std::thread icp_calculation {process_icp}; // loop constraint calculation via icp 
-    // SL (Q): Should define ROS parameters to decide whether to run isam2 as you described below, or the other option.
-    // I'm not 100% sure I understand what you mean by "uncomment this and comment all the above runisam2opt when node is added".
 	std::thread isam_update {process_isam}; // if you want to call less isam2 run (for saving redundant computations and no real-time visulization is required), uncommment this and comment all the above runisam2opt when node is added. 
 
-    // SL (Q): Visualization update frequency should be a ros parameter. And then we can add logic that if that
-    // parameter is negative (e.g. -1), that means to not run it at all.
 	std::thread viz_map {process_viz_map}; // visualization - map (low frequency because it is heavy)
 	std::thread viz_path {process_viz_path}; // visualization - path (high frequency)
 
