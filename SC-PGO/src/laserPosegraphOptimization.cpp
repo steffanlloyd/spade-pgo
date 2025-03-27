@@ -39,8 +39,6 @@
 
 #include <eigen3/Eigen/Dense>
 
-#include <ceres/ceres.h>
-
 #include <gtsam/inference/Symbol.h>
 #include <gtsam/nonlinear/Values.h>
 #include <gtsam/nonlinear/Marginals.h>
@@ -60,8 +58,8 @@
 #include <GeographicLib/LocalCartesian.hpp>
 #include <GeographicLib/Geoid.hpp>
 
-#include "aloam_velodyne/common.h"
-#include "aloam_velodyne/tic_toc.h"
+#include "scancontext/common.h"
+#include "scancontext/tic_toc.h"
 
 #include "scancontext/Scancontext.h"
 

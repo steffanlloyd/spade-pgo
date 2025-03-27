@@ -16,13 +16,13 @@
 - OpenMP
 - GTSAM
 - GeographicLib
-- laspy
 
 ## Features 
 1.  A strong place recognition and loop closing 
     - We integrated ScanContext as a loop detector into A-LOAM, and ISAM2-based pose-graph optimization is followed. (see https://youtu.be/okML_zNadhY?t=313 to enjoy the drift-closing moment)
 2. A modular implementation 
     - The only difference from A-LOAM is the addition of the `laserPosegraphOptimization.cpp` file. In the new file, we subscribe the point cloud topic and odometry topic (as a result of A-LOAM, published from `laserMapping.cpp`). That is, our implementation is generic to any front-end odometry methods. Thus, our pose-graph optimization module (i.e., `laserPosegraphOptimization.cpp`) can easily be integrated with any odometry algorithms such as non-LOAM family or even other sensors (e.g., visual odometry).  
+    - <p align="center"><img src="picture/anypipe.png" width=800></p>
 3. Complete GPS integration
 4. Implementation of GeographicLib for easy conversion to various global coordinate systems
 
@@ -41,4 +41,7 @@
     source devel/setup.bash
     roslaunch aloam_velodyne fastlio_mid360.launch #(or another launch file of your preference) 
 ```
-- After acquiring the data, you must see within your "save_directory" a "Scans" folder and the three following files "odom_poses.txt", "optimized_poses.txt", and "times.txt". Within the utils/python folder you will find the "makeMergedMapLas.py" file which will help you register the individual scans to the optimized poses and merge them into a single las file.
+- After acquiring the data, you must see within your "save_directory" a "Scans" folder and the three following files "odom_poses.txt", "optimized_poses.txt", and "times.txt". Within the utils/python folder you will find the "makeMergedMap.py" file which will help you register the individual scans to the optimized poses and merge them into a single pcd file.
+
+## Future work
+Replace the icp for fine registration with a global registration algorithm like TEASER++ (https://github.com/MIT-SPARK/TEASER-plusplus_) to precisely register the desired scans when closing a loop.
