@@ -65,7 +65,6 @@
 
 #include "scancontext/Scancontext.h"
 
-
 using namespace gtsam;
 
 using std::cout;
@@ -145,6 +144,12 @@ double filterSC;
 u_int8_t thrInitGps = 20;
 bool gpsInit = false;
 bool firstGPS = true;
+// For UTM
+int zoneUTM;
+bool northpUTM;
+double gammaUTM;
+double scaleUTM;
+double initUTM_x, initUTM_y;
 GeographicLib::LocalCartesian geoConverter;
 
 //ICP params (loop closing)
@@ -157,7 +162,7 @@ bool gotAbsMeas = false;
 
 std::string gpsTopic;
 
-ros::Publisher pubMapAftPGO, pubOdomAftPGO, pubPathAftPGO;   
+ros::Publisher pubMapAftPGO, pubOdomAftPGO, pubPathAftPGO;     
 ros::Publisher pubLoopScanLocal, pubLoopSubmapLocal;
 ros::Publisher pubOdomRepubVerifier;
 
@@ -193,13 +198,16 @@ void saveOdometryVerticesKITTIformat(std::string _filename)
                << col1.y() << " " << col2.y() << " " << col3.y() << " " << t.y() << " "
                << col1.z() << " " << col2.z() << " " << col3.z() << " " << t.z() << std::endl;
     }
+
+    // Save the offsets
+    stream << "OFFSET_X: " << initUTM_x << " OFFSET_Y: " << initUTM_y << " SCALE: " << scaleUTM << " ΖΟΝΕ: " << zoneUTM << " GAMMA: " << gammaUTM << " NORTH POLE: " << northpUTM << std::endl;
 }
 
 void saveOptimizedVerticesKITTIformat(gtsam::Values _estimates, std::string _filename)
 {
     using namespace gtsam;
 
-    // ref from gtsam's original code "dataset.cpp"
+    // Open file stream for output
     std::fstream stream(_filename.c_str(), std::fstream::out);
 
     for(const auto& key_value: _estimates) {
@@ -207,39 +215,47 @@ void saveOptimizedVerticesKITTIformat(gtsam::Values _estimates, std::string _fil
         if (!p) continue;
 
         const Pose3& pose = p->value();
+        const Point3 t = pose.translation();
+        const Rot3 R = pose.rotation();
 
-        Point3 t = pose.translation();
-        Rot3 R = pose.rotation();
-        auto col1 = R.column(1); // Point3
-        auto col2 = R.column(2); // Point3
-        auto col3 = R.column(3); // Point3
+        auto col1 = R.column(1);
+        auto col2 = R.column(2);
+        auto col3 = R.column(3);
 
+        // Save the rotation columns and the UTM translation.  
         stream << col1.x() << " " << col2.x() << " " << col3.x() << " " << t.x() << " "
                << col1.y() << " " << col2.y() << " " << col3.y() << " " << t.y() << " "
                << col1.z() << " " << col2.z() << " " << col3.z() << " " << t.z() << std::endl;
     }
+
+    // Save the offsets
+    stream << "OFFSET_X: " << initUTM_x << " OFFSET_Y: " << initUTM_y << " SCALE: " << scaleUTM << " ΖΟΝΕ: " << zoneUTM << " GAMMA: " << gammaUTM << " NORTH POLE: " << northpUTM << std::endl;
 }
 
+  
 nav_msgs::Odometry::ConstPtr navSatFixToUTMOdometry(const sensor_msgs::NavSatFix::ConstPtr& nav_sat_fix)
 {
-    // For UTM
-    int zone;
-    bool northp;
+
     double x_utm, y_utm;
-    double gamma;
-    double scale;
 
     // Convert from WGS84 lat/lon to UTM using GeographicLib’s UTM/UPS converter
-    GeographicLib::UTMUPS::Forward(nav_sat_fix->latitude, nav_sat_fix->longitude, zone, northp, x_utm, y_utm, gamma, scale);
+    GeographicLib::UTMUPS::Forward(nav_sat_fix->latitude, nav_sat_fix->longitude, zoneUTM, northpUTM, x_utm, y_utm, gammaUTM, scaleUTM);
+
+    if (firstGPS)  
+    {   
+        initUTM_x = x_utm;
+        initUTM_y = y_utm;  
+        firstGPS = false;
+    }
 
     // Create an Odometry message
     nav_msgs::Odometry odom;
     odom.header.frame_id = "map";   // Set the frame ID
     odom.header.stamp = nav_sat_fix->header.stamp; // Use the timestamp from NavSatFix
 
-    // Set the position in the Odometry message
-    odom.pose.pose.position.x = x_utm;
-    odom.pose.pose.position.y = y_utm;
+    // Set the position in the Odometry message (convert first to a local frame and keep the offsets)
+    odom.pose.pose.position.x = x_utm - initUTM_x;
+    odom.pose.pose.position.y = y_utm - initUTM_y;
     odom.pose.pose.position.z = nav_sat_fix->altitude;  // Use altitude for Z in the UTM frame
 
     // Set an identity orientation if orientation information is not available
@@ -299,8 +315,6 @@ nav_msgs::Odometry::ConstPtr navSatFixToLCOdometry(const sensor_msgs::NavSatFix:
 
     // Create a shared pointer to the Odometry object
     nav_msgs::Odometry::Ptr odom_ptr = boost::make_shared<nav_msgs::Odometry>(odom);
-
-    //geoConverter.Reverse ... for acquiring LLA
 
     // Return a ConstPtr from that
     return nav_msgs::Odometry::ConstPtr(odom_ptr);
@@ -432,16 +446,24 @@ void pubPath( void )
     pubOdomAftPGO.publish(odomAftPGO); // last pose 
     pubPathAftPGO.publish(pathAftPGO); // poses 
 
+    // SL: Updates the transform
+    // Only send a transform if the timestamp has changed.
     static tf::TransformBroadcaster br;
-    tf::Transform transform;
-    tf::Quaternion q;
-    transform.setOrigin(tf::Vector3(odomAftPGO.pose.pose.position.x, odomAftPGO.pose.pose.position.y, odomAftPGO.pose.pose.position.z));
-    q.setW(odomAftPGO.pose.pose.orientation.w);
-    q.setX(odomAftPGO.pose.pose.orientation.x);
-    q.setY(odomAftPGO.pose.pose.orientation.y);
-    q.setZ(odomAftPGO.pose.pose.orientation.z);
-    transform.setRotation(q);
-    br.sendTransform(tf::StampedTransform(transform, odomAftPGO.header.stamp, "camera_init", "/aft_pgo"));
+    static ros::Time last_tf_time;
+    if (odomAftPGO.header.stamp != last_tf_time)
+    {
+        last_tf_time = odomAftPGO.header.stamp;
+        
+        tf::Transform transform;
+        tf::Quaternion q;
+        transform.setOrigin(tf::Vector3(odomAftPGO.pose.pose.position.x, odomAftPGO.pose.pose.position.y, odomAftPGO.pose.pose.position.z));
+        q.setW(odomAftPGO.pose.pose.orientation.w);
+        q.setX(odomAftPGO.pose.pose.orientation.x);
+        q.setY(odomAftPGO.pose.pose.orientation.y);
+        q.setZ(odomAftPGO.pose.pose.orientation.z);
+        transform.setRotation(q);
+        br.sendTransform(tf::StampedTransform(transform, odomAftPGO.header.stamp, "camera_init", "/aft_pgo"));
+    }
 } // pubPath
 
 void updatePoses(void)
@@ -662,7 +684,8 @@ void process_pg()
                 auto thisGPS = gpsBuf.front();
                 auto thisGPSTime = thisGPS->header.stamp.toSec();
                 if( abs(thisGPSTime - timeLaserOdometry) < eps ) {
-                    currGPS = navSatFixToLCOdometry(thisGPS);
+                    // currGPS = navSatFixToLCOdometry(thisGPS);
+                    currGPS = navSatFixToUTMOdometry(thisGPS);
                     hasGPSforThisKF = true; 
                     break;
                 } else {
