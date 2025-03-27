@@ -11,6 +11,7 @@
 - OpenMP
 - GTSAM
 - GeographicLib
+- laspy
 
 ## Features 
 1. A strong place recognition and loop closing 
