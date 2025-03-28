@@ -26,6 +26,10 @@
 #include <pcl/registration/gicp.h>
 #include <pcl/registration/ndt.h>
 
+#include <small_gicp/registration/registration_helper.hpp>
+#include <small_gicp/points/point_cloud.hpp>
+#include <small_gicp/util/downsampling.hpp>
+
 #include <ros/ros.h>
 #include <sensor_msgs/Imu.h>
 #include <sensor_msgs/PointCloud2.h>
@@ -129,6 +133,7 @@ std::mutex mtxRecentPose;
 
 pcl::PointCloud<PointType>::Ptr laserCloudMapPGO(new pcl::PointCloud<PointType>());
 pcl::VoxelGrid<PointType> downSizeFilterMapPGO;
+double mapVizFilterSize;
 bool laserCloudMapPGORedraw = true;    
 
 nav_msgs::Odometry::ConstPtr currGPS, lastGPS;
@@ -155,17 +160,22 @@ GeographicLib::LocalCartesian geoConverter;
 std::string loopClosureMethod;
 int numHistKeyframesIcpOld, numHistKeyframesIcpCurr;
 double loopIcpFitnessScoreThreshold;
-double filterIcp;
+double voxelizationLeafSizeICP;
 double loopNoiseScore;
 double loopClosureNoiseScale;
 double ICPMaxCorrespondenceDistance;
 int ICPRANSACIterations;
 bool ICPSavePointclouds;
+bool ICPPublishPointclouds;
 
+bool useScanControlLoopClosure;
+bool useNearKFLoopClosure;
 int nearKFProcessedId = 0;
 int lcMinStepSeperation;
 double lcDistanceThreshold;
 double lcDistanceThreshold2;
+double consecutiveLCMinDistance;
+double consecutiveLCMinDistance2;
 
 bool triggerExtraGraphOptimization = false;
 
@@ -627,12 +637,39 @@ void loopFindNearKeyframesCloud( pcl::PointCloud<PointType>::Ptr& nearKeyframes,
     if (nearKeyframes->empty())
         return;
 
-    // downsample near keyframes
-    pcl::PointCloud<PointType>::Ptr cloud_temp(new pcl::PointCloud<PointType>());  
-    downSizeFilterICP.setInputCloud(nearKeyframes);
-    downSizeFilterICP.filter(*cloud_temp);
-    *nearKeyframes = *cloud_temp;
+    // downsample near keyframes. Don't do this for small_gicp, since it can do
+    // this more efficiently within the algorithm itself.
+    if(loopClosureMethod != "small_gicp" && loopClosureMethod != "small_vgicp"){
+        pcl::PointCloud<PointType>::Ptr cloud_temp(new pcl::PointCloud<PointType>());  
+        downSizeFilterICP.setInputCloud(nearKeyframes);
+        downSizeFilterICP.filter(*cloud_temp);
+        *nearKeyframes = *cloud_temp;
+    }
 } // loopFindNearKeyframesCloud
+
+
+// Helper function
+std::shared_ptr<small_gicp::PointCloud> pclToEigen(const pcl::PointCloud<PointType>::Ptr& pcl_cloud) {
+    std::vector<Eigen::Vector3d> points;
+    points.reserve(pcl_cloud->points.size());  // Reserve space for efficiency
+
+    for (const auto& point : pcl_cloud->points) {
+        points.emplace_back(point.x, point.y, point.z);
+    }
+
+    return std::make_shared<small_gicp::PointCloud>(points);
+}
+pcl::PointCloud<pcl::PointXYZ>::Ptr eigenToPcl(const std::shared_ptr<small_gicp::PointCloud> eigen_cloud) {
+    pcl::PointCloud<pcl::PointXYZ>::Ptr pcl_cloud(new pcl::PointCloud<pcl::PointXYZ>());
+    pcl_cloud->resize(eigen_cloud->size());
+    for (size_t i = 0; i<eigen_cloud->size(); ++i)
+    {
+        pcl_cloud->points[i].x = eigen_cloud->points[i][0];
+        pcl_cloud->points[i].y = eigen_cloud->points[i][1];
+        pcl_cloud->points[i].z = eigen_cloud->points[i][2];
+    }
+    return pcl_cloud;
+}
 
 // SL: Compute the relative pose between two key frame indicies 
 // SL: Modified to return the noise model as well   
@@ -647,16 +684,17 @@ std::optional<std::pair<gtsam::Pose3, gtsam::noiseModel::Base::shared_ptr>> doIC
     loopFindNearKeyframesCloud(targetKeyframeCloud, _loop_kf_idx, numHistKeyframesIcpOld);   
 
     // loop verification
-    // SL (Q): Whether or not to spend time publishing these frames should be a ROS parameter 
-    sensor_msgs::PointCloud2 currKeyframeCloudMsg;   
-    pcl::toROSMsg(*currKeyframeCloud, currKeyframeCloudMsg);
-    currKeyframeCloudMsg.header.frame_id = "camera_init";     
-    pubLoopScanLocal.publish(currKeyframeCloudMsg);
-
-    sensor_msgs::PointCloud2 targetKeyframeCloudMsg;
-    pcl::toROSMsg(*targetKeyframeCloud, targetKeyframeCloudMsg);
-    targetKeyframeCloudMsg.header.frame_id = "camera_init";
-    pubLoopSubmapLocal.publish(targetKeyframeCloudMsg);
+    if(ICPPublishPointclouds){
+        sensor_msgs::PointCloud2 currKeyframeCloudMsg;   
+        pcl::toROSMsg(*currKeyframeCloud, currKeyframeCloudMsg);
+        currKeyframeCloudMsg.header.frame_id = "camera_init";     
+        pubLoopScanLocal.publish(currKeyframeCloudMsg);
+    
+        sensor_msgs::PointCloud2 targetKeyframeCloudMsg;
+        pcl::toROSMsg(*targetKeyframeCloud, targetKeyframeCloudMsg);
+        targetKeyframeCloudMsg.header.frame_id = "camera_init";
+        pubLoopSubmapLocal.publish(targetKeyframeCloudMsg);
+    }
 
     // Save the two point clouds to PCD files
     // Save the two point clouds using filenames that reflect their keyframe indices
@@ -669,17 +707,14 @@ std::optional<std::pair<gtsam::Pose3, gtsam::noiseModel::Base::shared_ptr>> doIC
         pcl::io::savePCDFileASCII(loop_filename.str(), *targetKeyframeCloud);
     }
 
-    // ------------------------
-    //  Fine ICP
-    // ------------------------
-    // SL (Q): Did you try NDT by chance? Did it work better/worse?
-
     bool isConverged;
     float fitnessScore;
-    Eigen::Affine3f correctionLidarFrame;
+    Eigen::Isometry3d correctionTransform;
     
     // Get the current time before ICP computation
     ros::Time icp_start_time = ros::Time::now();
+    pcl::PointCloud<PointType>::Ptr reg_result(new pcl::PointCloud<PointType>());
+
     
     if(loopClosureMethod == "gicp"){
 
@@ -693,12 +728,11 @@ std::optional<std::pair<gtsam::Pose3, gtsam::noiseModel::Base::shared_ptr>> doIC
         gicp.setInputSource(currKeyframeCloud);
         gicp.setInputTarget(targetKeyframeCloud);
     
-        pcl::PointCloud<PointType>::Ptr fine_result(new pcl::PointCloud<PointType>());
-        gicp.align(*fine_result);
+        gicp.align(*reg_result);
 
         isConverged = gicp.hasConverged();
         fitnessScore = gicp.getFitnessScore();
-        correctionLidarFrame = gicp.getFinalTransformation();
+        correctionTransform = gicp.getFinalTransformation().cast<double>();
 
     }else if(loopClosureMethod == "icp"){
 
@@ -712,12 +746,11 @@ std::optional<std::pair<gtsam::Pose3, gtsam::noiseModel::Base::shared_ptr>> doIC
         icp.setInputSource(currKeyframeCloud);
         icp.setInputTarget(targetKeyframeCloud);
     
-        pcl::PointCloud<PointType>::Ptr fine_result(new pcl::PointCloud<PointType>());
-        icp.align(*fine_result);
+        icp.align(*reg_result);
 
         isConverged = icp.hasConverged();
         fitnessScore = icp.getFitnessScore();
-        correctionLidarFrame = icp.getFinalTransformation();
+        correctionTransform = icp.getFinalTransformation().cast<double>();
 
     }else if(loopClosureMethod == "ndt"){
 
@@ -731,12 +764,32 @@ std::optional<std::pair<gtsam::Pose3, gtsam::noiseModel::Base::shared_ptr>> doIC
         ndt.setInputSource(currKeyframeCloud);
         ndt.setInputTarget(targetKeyframeCloud);
     
-        pcl::PointCloud<PointType>::Ptr ndt_result(new pcl::PointCloud<PointType>());
-        ndt.align(*ndt_result);
+        ndt.align(*reg_result);
         
         isConverged = ndt.hasConverged();
         fitnessScore = ndt.getFitnessScore();
-        correctionLidarFrame = ndt.getFinalTransformation();
+        correctionTransform = ndt.getFinalTransformation().cast<double>();
+
+    }else if(loopClosureMethod == "small_gicp" || loopClosureMethod == "small_vgicp"){
+        
+        auto source = pclToEigen(currKeyframeCloud);
+        auto target = pclToEigen(targetKeyframeCloud); 
+        small_gicp::RegistrationSetting settings;
+        settings.num_threads = 6;                    // Number of threads to be used
+        settings.max_correspondence_distance = ICPMaxCorrespondenceDistance;  // Maximum correspondence distance between points (e.g., triming threshold)
+        settings.voxel_resolution = 1.0;
+        settings.max_iterations = 20;
+        settings.downsampling_resolution = voxelizationLeafSizeICP;
+        if (loopClosureMethod == "small_gicp") settings.type = small_gicp::RegistrationSetting::RegistrationType::GICP;
+        else if(loopClosureMethod == "small_vgicp") settings.type = small_gicp::RegistrationSetting::RegistrationType::VGICP;
+        else ROS_ERROR("Invalid small_gicp method: %s", loopClosureMethod.c_str());
+
+        Eigen::Isometry3d init_transform = Eigen::Isometry3d::Identity();
+        small_gicp::RegistrationResult result = small_gicp::align(target->points, source->points, init_transform, settings);
+
+        isConverged = result.converged;
+        fitnessScore = result.error / result.num_inliers;
+        correctionTransform = result.T_target_source;
 
     }else{
         ROS_ERROR("Invalid loopClosureMethod: %s. Expected \"icp\", \"gicp\", or \"ndt\". Skipping loop closure.", loopClosureMethod.c_str());
@@ -744,18 +797,14 @@ std::optional<std::pair<gtsam::Pose3, gtsam::noiseModel::Base::shared_ptr>> doIC
     }
 
     if (!isConverged || fitnessScore > loopIcpFitnessScoreThreshold) {
-        ROS_WARN("[SC loop] ICP fitness test failed (%.4g > %.4g). Not adding SC loop between %d and %d. ICP runtime: %.3g ms.", fitnessScore, loopIcpFitnessScoreThreshold, _loop_kf_idx, _curr_kf_idx, (ros::Time::now() - icp_start_time).toSec()*1e3);
+        ROS_WARN("[Loop Closure] ICP fitness test failed (%.4g > %.4g). Not adding loop closure between %d and %d. ICP runtime: %.3g ms.", fitnessScore, loopIcpFitnessScoreThreshold, _loop_kf_idx, _curr_kf_idx, (ros::Time::now() - icp_start_time).toSec()*1e3);
         return std::nullopt;
     } else {
-        ROS_INFO("[SC loop] ICP fitness test passed (%.4g < %.4g). Adding SC loop between %d and %d. ICP runtime: %.3g ms.", fitnessScore, loopIcpFitnessScoreThreshold, _loop_kf_idx, _curr_kf_idx, (ros::Time::now() - icp_start_time).toSec()*1e3);
+        ROS_INFO("[Loop Closure] ICP fitness test passed (%.4g < %.4g). Adding loop closure between %d and %d. ICP runtime: %.3g ms.", fitnessScore, loopIcpFitnessScoreThreshold, _loop_kf_idx, _curr_kf_idx, (ros::Time::now() - icp_start_time).toSec()*1e3);
     }
 
-    // Get pose transformation
-    float x, y, z, roll, pitch, yaw;
-    pcl::getTranslationAndEulerAngles (correctionLidarFrame, x, y, z, roll, pitch, yaw);
-    gtsam::Pose3 poseFrom = Pose3(Rot3::RzRyRx(roll, pitch, yaw), Point3(x, y, z));
-    gtsam::Pose3 poseTo = Pose3(Rot3::RzRyRx(0.0, 0.0, 0.0), Point3(0.0, 0.0, 0.0));
-    // SL (Q): This is equivalent to gtsam::Pose3 poseTo = Pose3::identity();
+    // Get pose transformation (need to take inverse)
+    gtsam::Pose3 betweenPose = Pose3(correctionTransform.matrix()).inverse();
 
     // Compute the noise model proportional to the fitness score squared
     gtsam::Vector robustNoiseVector6(6);
@@ -767,7 +816,7 @@ std::optional<std::pair<gtsam::Pose3, gtsam::noiseModel::Base::shared_ptr>> doIC
                     );
 
     // Return both the relative pose and the noise model
-    return std::make_pair(poseFrom.between(poseTo), loopNoise);
+    return std::make_pair(betweenPose, loopNoise);
 } // doICPVirtualRelative
 
 void process_pg()
@@ -846,26 +895,12 @@ void process_pg()
             translationAccumulated += delta_translation;
             rotationAccumulated += (dtf.roll + dtf.pitch + dtf.yaw); // sum just naive approach.  
 
-            if( translationAccumulated > keyframeMeterGap || rotationAccumulated > keyframeRadGap ) {
-                isNowKeyFrame = true;
-                translationAccumulated = 0.0; // reset 
-                rotationAccumulated = 0.0; // reset 
-            } else {
-                isNowKeyFrame = false;
-            }
-
-            if( ! isNowKeyFrame ) 
-                continue; 
-
-            // SL (Q): Suggested refactor:
-            //
-            // // Break out of loop if distance travelled is insufficient. Otherwise, reset accumulated travel.
-            // if( translationAccumulated < keyframeMeterGap && rotationAccumulated < keyframeRadGap ) continue;
-            //
-            // translationAccumulated = 0.0; // reset 
-            // rotationAccumulated = 0.0; // reset 
+            // Break out of loop if distance travelled is insufficient. Otherwise, reset accumulated travel.
+            if( translationAccumulated < keyframeMeterGap && rotationAccumulated < keyframeRadGap ) continue;
             
-            //
+            translationAccumulated = 0.0; // reset 
+            rotationAccumulated = 0.0; // reset 
+            
             // Save data and Add consecutive node 
             //
             // SL: Downsample input point cloud from thisKeyFrame according to voxel
@@ -1112,21 +1147,40 @@ void performSCLoopClosure(void)
 } // performSCLoopClosure
 
 // Add keyframes based on nearby keyframes
+int lastDetectedLC_id1 = -1;
 void performNearKFClosure(){
     
-    while(nearKFProcessedId < recentIdxUpdated){
+    while(nearKFProcessedId < recentIdxUpdated-1){
+        // Increment the frame we're checking
+        nearKFProcessedId++;
 
-        // Check every frame, at intervals, for KF that are close.
-        // The interval is half the number of keyframes used in the LC detection
-        for (int j = 0; j < recentIdxUpdated - lcMinStepSeperation; j+= static_cast<int>(numHistKeyframesIcpOld / 2)) {
+        if(lastDetectedLC_id1 >= 0 &&
+            euclideanDistance2(keyframePosesUpdated[nearKFProcessedId], keyframePosesUpdated[lastDetectedLC_id1]) < consecutiveLCMinDistance2){
+             // We're still too close to a previously detected loop closure
+             // Skip
+             continue;
+         }
+
+        // We're not too close a loop closure (current). Now check all previous frames for nearby loop closures
+        int lastDetectedLC_id2 = -1;
+        for (int j = 0; j < recentIdxUpdated - lcMinStepSeperation; ++j) {
+            // If we've already detected a nearby KF (past) for this current keyframe, check that the current frame isn't super close to that one.
+            if(lastDetectedLC_id2 >= 0 &&
+               euclideanDistance2(keyframePosesUpdated[j], keyframePosesUpdated[lastDetectedLC_id2]) < consecutiveLCMinDistance2){
+                // We're still too close to the previous LC
+                // Skip
+                continue;
+            }
+
+            // Check if we're within tolerance
             double distance2 = euclideanDistance2(keyframePosesUpdated[j], keyframePosesUpdated[nearKFProcessedId]);
             if (distance2 < lcDistanceThreshold2) {
                 submitLoopClosureCandidate(j, nearKFProcessedId);
-                ROS_INFO("Added candidate loop closure pairs, distance %.3g m < %.3g m", sqrt(distance2), lcDistanceThreshold);
+                lastDetectedLC_id1 = nearKFProcessedId;
+                lastDetectedLC_id2 = j;
+                ROS_INFO("Added candidate loop closure pairs %d / %d, distance %.3g m < %.3g m", j, nearKFProcessedId, sqrt(distance2), lcDistanceThreshold);
             }
         }
-
-        nearKFProcessedId+=static_cast<int>(numHistKeyframesIcpOld / 2);
     }
 }
 
@@ -1134,16 +1188,16 @@ void performNearKFClosure(){
 void process_lcd(void)
 {
     // SL (Q): Loop closure frequency should be a ROS param
-    float loopClosureFrequency = 1.0; // can change 
+    float loopClosureFrequency = 0.4; // can change 
     ros::Rate rate(loopClosureFrequency);
     while (ros::ok())
     {
         rate.sleep();
         // SL (Q): I'm curious how well ScanContext does at identifying loop closures in the forest context. It's design for an urban environment. It matches the highest point in the point cloud in an area. In an urban environment, this works well because features have distinct upper roofs. But, in our context the top of the forest is rarely meausrements, so it may not be reliable. Instead we're just always surrounded by forests. Maybe better to just rely on the LIO position, and detect candidate loop closures as estimated close keyframes? Or use some other metric? E.g. just calculate the distance between each pair of key frames, then find pairs that are nearby as candidates.
-        performSCLoopClosure();
+        if(useScanControlLoopClosure) performSCLoopClosure();
 
         // Try LC based on naive KF distance
-        performNearKFClosure();
+        if(useNearKFLoopClosure) performNearKFClosure();
     }
 } // process_lcd
 
@@ -1160,8 +1214,9 @@ void process_icp(void)
 
             mBuf.lock(); 
             std::pair<int, int> loop_idx_pair = loopClosureCandidateBuf.front();
-            // SL: We can't process loop closures until the pose has been updated by the graph. Skip
-            // any that are not updated.
+
+            // SL: We can't process loop closures until the pose has been updated by the graph.
+            // Skip any that are not updated.
             if(loop_idx_pair.first>=recentIdxUpdated || loop_idx_pair.second>=recentIdxUpdated){
                 mBuf.unlock(); 
                 continue;
@@ -1173,20 +1228,18 @@ void process_icp(void)
             // get BetweenFactor between poses (or std::nullopt if doesn't pass test)
             const int prev_node_idx = loop_idx_pair.first;
             const int curr_node_idx = loop_idx_pair.second;
+            
             auto relative_pose_optional = doICPVirtualRelative(prev_node_idx, curr_node_idx);
 
             // SL: Add between factor to graph if valid
             if(relative_pose_optional) {
                 auto [relative_pose, loopNoise] = relative_pose_optional.value();
-                // gtsam::Pose3 relative_pose = relative_pose_optional.value();
+
                 mtxPosegraph.lock();
                 gtSAMgraph.add(gtsam::BetweenFactor<gtsam::Pose3>(prev_node_idx, curr_node_idx, relative_pose, loopNoise));
                 triggerExtraGraphOptimization = true;
-                // SL (Q): May want to set triggerExtraGraphOptimization = true here to process the loop closure faster
-                // Although, it might be better to rename the variable as: triggerExtraGraphOptimization
-
-                // runISAM2opt();
                 mtxPosegraph.unlock();
+
                 // Add to list of added loop closures
                 loopClosureIdsAdded.push_back(std::pair<int, int>(prev_node_idx, curr_node_idx));
             } 
@@ -1223,7 +1276,7 @@ void process_isam(void)
             // cout << "running isam2 optimization ..." << endl;
             mtxPosegraph.unlock();
 
-            // SL (Q): What is happening here?
+            // Save poses and vertices
             saveOptimizedVerticesKITTIformat(isamCurrentEstimate, pgKITTIformat); // pose
             saveOdometryVerticesKITTIformat(odomKITTIformat); // pose
         }
@@ -1233,20 +1286,14 @@ void process_isam(void)
 // SL: Publishes the global map, optimized from the pose graph
 void pubMap(void)
 {
-    int SKIP_FRAMES = 2; // sparse map visulalization to save computations 
-    int counter = 0;
+    int SKIP_FRAMES = 2; // sparse map visulalization to save computations
 
     laserCloudMapPGO->clear();
 
     mKF.lock(); 
-    // for (int node_idx=0; node_idx < int(keyframePosesUpdated.size()); node_idx++) {
-    // SL (Q): Why not use the line that is commented out above?
     // SL: Loop through all elements of keyframePosesUpdates, add the local cloud to the global map cloud
-    for (int node_idx=0; node_idx < recentIdxUpdated; node_idx++) {
-        if(counter % SKIP_FRAMES == 0) {
-            *laserCloudMapPGO += *local2global(keyframeLaserClouds[node_idx], keyframePosesUpdated[node_idx]);
-        }
-        counter++;
+    for (int node_idx=0; node_idx < recentIdxUpdated; node_idx+=SKIP_FRAMES) {
+        *laserCloudMapPGO += *local2global(keyframeLaserClouds[node_idx], keyframePosesUpdated[node_idx]);
     }
     mKF.unlock(); 
 
@@ -1314,20 +1361,26 @@ int main(int argc, char **argv)
     nh.param<double>("gps_scale_z", gpsScaleZ, 1e2); // Scaling factor to be multiplied with gps Covariance (on z axis only, in addition to the gps_scale)
 
     //ICP Loop Params
-    nh.param<std::string>("loop_closure_method", loopClosureMethod, "gicp"); // icp, gicp, or ndt
+    nh.param<std::string>("loop_closure_method", loopClosureMethod, "small_gicp"); // icp, gicp, or ndt
+
     nh.param<int>("icp_num_keyframes_old", numHistKeyframesIcpOld, 10); // Number of keyframes point cloud to be included in the submap for icp alignment (old keyframe)
     nh.param<int>("icp_num_keyframes_curr", numHistKeyframesIcpCurr, 3); // Number of keyframes point cloud to be included in the submap for icp alignment (current keyframe)
     nh.param<double>("icp_loop_fitness_score_thr", loopIcpFitnessScoreThreshold, 0.3); // ICP's loop fitness score threshold to accept closing a loop (i.e. registration was successful)
-    nh.param<double>("icp_leaf_size_down", filterIcp, 0.2); // ICP's downsampling   
+    nh.param<double>("icp_leaf_size_down", voxelizationLeafSizeICP, 0.2); // ICP's downsampling   
     nh.param<double>("loop_noise_score", loopNoiseScore, 0.8); // Loop Noise variance
     nh.param<double>("loop_closure_noise_scale", loopClosureNoiseScale, 1); // Loop Noise variance
     nh.param<double>("icp_max_correspondence_distance", ICPMaxCorrespondenceDistance, 2); // Loop Noise variance
     nh.param<int>("icp_ransac_iterations", ICPRANSACIterations, 10); // Loop Noise variance
     nh.param<bool>("icp_save_pointclouds", ICPSavePointclouds, false); // Loop Noise variance
+    nh.param<bool>("icp_publish_pointclouds", ICPPublishPointclouds, false); // Loop Noise variance
 
+    nh.param<bool>("use_scan_control_loop_closure", useScanControlLoopClosure, true);
+    nh.param<bool>("use_near_kf_loop_closure", useNearKFLoopClosure, true);
     nh.param<int>("lc_min_step_seperation", lcMinStepSeperation, 20);
     nh.param<double>("near_kf_threshold", lcDistanceThreshold, 10); // Loop Noise variance
     lcDistanceThreshold2 = lcDistanceThreshold*lcDistanceThreshold;
+    nh.param<double>("consecutive_lc_min_distance", consecutiveLCMinDistance, 5); // Loop Noise variance
+    consecutiveLCMinDistance2 = consecutiveLCMinDistance*consecutiveLCMinDistance;
     
 
     ISAM2Params parameters;
@@ -1340,9 +1393,8 @@ int main(int argc, char **argv)
     scManager.setMaximumRadius(scMaximumRadius);
 
     downSizeFilterScancontext.setLeafSize(filterSC, filterSC, filterSC);
-    downSizeFilterICP.setLeafSize(filterIcp, filterIcp, filterIcp);
+    downSizeFilterICP.setLeafSize(voxelizationLeafSizeICP, voxelizationLeafSizeICP, voxelizationLeafSizeICP);
 
-    double mapVizFilterSize;
 	nh.param<double>("mapviz_filter_size", mapVizFilterSize, 0.4); // pose assignment every k frames 
     downSizeFilterMapPGO.setLeafSize(mapVizFilterSize, mapVizFilterSize, mapVizFilterSize);
 

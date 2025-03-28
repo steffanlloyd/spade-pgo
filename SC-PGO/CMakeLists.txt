@@ -26,6 +26,7 @@ find_package(OpenCV REQUIRED)
 
 find_package(OpenMP REQUIRED)
 find_package(GTSAM REQUIRED QUIET)
+find_package(small_gicp REQUIRED)
 
 include_directories(
   include
@@ -65,6 +66,7 @@ target_link_libraries(alaserPGO
   ${OpenMP_CXX_FLAGS}
   gtsam
   Geographic
+  small_gicp
 )
 
 
