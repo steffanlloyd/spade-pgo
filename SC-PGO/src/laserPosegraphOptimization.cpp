@@ -36,6 +36,7 @@
 #include <std_msgs/Float64.h>
 #include <sensor_msgs/PointCloud2.h>
 #include <sensor_msgs/NavSatFix.h>
+#include <sensor_msgs/MagneticField.h>
 #include <tf/transform_datatypes.h>
 #include <tf/transform_broadcaster.h>
 #include <nav_msgs/Odometry.h>
@@ -64,6 +65,7 @@
 #include <GeographicLib/Geocentric.hpp>
 #include <GeographicLib/LocalCartesian.hpp>
 #include <GeographicLib/Geoid.hpp>
+// #include <GeographicLib/MagneticModel.hpp>
 
 #include "aloam_velodyne/common.h"
 #include "aloam_velodyne/tic_toc.h"
@@ -93,8 +95,8 @@ double rotationAccumulated = 1000000.0; // large value means must add the first 
 
 bool isNowKeyFrame = false; 
 
-Isometry3d odom_pose_prev = Isometry3d::Identity(); // init 
-Isometry3d odom_pose_curr = Isometry3d::Identity(); // init 
+Isometry3d T_odom_prev = Isometry3d::Identity(); // init 
+Isometry3d T_odom_curr = Isometry3d::Identity(); // init 
 gtsam::Pose3 T_odom_to_gps;
 
 std::queue<nav_msgs::Odometry::ConstPtr> odometryBuf;
@@ -115,6 +117,7 @@ double timeLaser = 0.0;
 pcl::PointCloud<PointType>::Ptr laserCloudMapAfterPGO(new pcl::PointCloud<PointType>());
 
 std::vector<pcl::PointCloud<PointType>::Ptr> keyframeLaserClouds; 
+std::vector<pcl::PointCloud<PointType>::Ptr> keyframeLaserCloudsViz; 
 std::vector<Isometry3d> keyframePoses;
 std::vector<Isometry3d> keyframePosesUpdated;
 std::vector<gtsam::GPSFactor> keyframeGpsFactor;
@@ -131,18 +134,20 @@ noiseModel::Base::shared_ptr robustLoopNoise;
 noiseModel::Base::shared_ptr robustGPSNoise;
 double noiseLIOLinear, noiseLIORotational;
 
-pcl::VoxelGrid<PointType> downSizeFilterScancontext;
+pcl::VoxelGrid<PointType> voxelFilterScanContext;
+pcl::VoxelGrid<PointType> voxelFilterMapViz;
+pcl::VoxelGrid<PointType> voxelFilterICP;
+pcl::VoxelGrid<PointType> voxelFilterSave;
+
 SCManager scManager;
 double scDistThres, scMaximumRadius;
 
-pcl::VoxelGrid<PointType> downSizeFilterICP;
 std::mutex mtxICP;
 std::mutex mtxPosegraph;
 std::mutex mtxRecentPose;
 
 pcl::PointCloud<PointType>::Ptr laserCloudMapPGO(new pcl::PointCloud<PointType>());
-pcl::VoxelGrid<PointType> downSizeFilterMapPGO;
-double mapVizFilterSize;
+double voxelLeafSizeViz;
 bool laserCloudMapPGORedraw = true;    
 
 std::optional<nav_msgs::Odometry::ConstPtr> currGPS, lastGPS;
@@ -159,8 +164,9 @@ double gpsDistThr;
 double gpsCovThr;
 double gpsScale;
 double gpsScaleZ;
-double filterSC;
+double voxelLeafSizeScanContext;
 u_int8_t thrInitGps = 30;
+double gpsTimeDelta = 0.1;
 bool gpsInit = false;
 bool firstGPS = true;
 GeographicLib::LocalCartesian geoConverter;
@@ -169,7 +175,7 @@ GeographicLib::LocalCartesian geoConverter;
 std::string loopClosureMethod;
 int numHistKeyframesIcpOld, numHistKeyframesIcpCurr;
 double loopIcpFitnessScoreThreshold;
-double voxelizationLeafSizeICP;
+double voxelLeafSizeICP;
 double loopNoiseScore;
 double loopClosureNoiseScale;
 double ICPMaxCorrespondenceDistance;
@@ -205,17 +211,42 @@ std::string odomKITTIformat;
 std::fstream pgTimeSaveStream;
 
 // Extra SL stuff
-std::deque<double> headingBuf;
+// std::deque<Eigen::Vector3d> magnetometerBuf;
 std::deque<Eigen::Vector3d> IMUAccelBuf;
+std::deque<double> headingBuf;
 const size_t maxCalBufferSize = 10;
-bool firstPoseInitialized = false;
-Pose6D firstPose{0,0,0,0,0,0};
-Matrix3d calibratedInitialRotation;
+Isometry3d T0 = Isometry3d::Identity();
+double voxelLeafSizeSave;
+
+std::vector<std::pair<Isometry3d, pcl::PointCloud<PointType>::Ptr>> inter_kf_pointclouds;
+
 
 std::string padZeros(int val, int num_digits = 6) {
-  std::ostringstream out;
-  out << std::internal << std::setfill('0') << std::setw(num_digits) << val;
-  return out.str();
+    std::ostringstream out;
+    out << std::internal << std::setfill('0') << std::setw(num_digits) << val;
+    return out.str();
+}
+
+std::string IsometryToStr(Isometry3d T){
+    // Extract translation
+    Eigen::Vector3d translation = T.translation();
+    
+    // Extract rotation and convert to Quaternion
+    Eigen::Quaterniond quat(T.rotation());
+    
+    // Convert Quaternion to tf::Quaternion
+    tf::Quaternion tf_quat(quat.x(), quat.y(), quat.z(), quat.w());
+    
+    // Convert tf::Quaternion to Roll, Pitch, Yaw
+    double roll, pitch, yaw;
+    tf::Matrix3x3(tf_quat).getRPY(roll, pitch, yaw);
+    
+    // ROS_INFO("Translation: x = %f, y = %f, z = %f, roll = %f, pitch = %f, yaw = %f", translation.x(), translation.y(), translation.z(), roll, pitch, yaw);
+    // Format translation and rotation as a string
+    char buffer[200];
+    std::snprintf(buffer, sizeof(buffer), "{x = %.4f, y = %.4f, z = %.4f, roll = %.4f, pitch = %.4f, yaw = %.4f}", translation.x(), translation.y(), translation.z(), roll, pitch, yaw);
+    
+    return std::string(buffer);
 }
 
 // Function to compute Euclidean distance (squared) between two poses
@@ -225,9 +256,20 @@ double euclideanDistance2(const Pose6D& p1, const Pose6D& p2) {
             (p1.z - p2.z) * (p1.z - p2.z);
 }
 
+// Function to compute Euclidean distance (squared) between two poses
+double euclideanDistance2(const Isometry3d& T1, const Isometry3d& T2) {
+    return (T1.translation() - T2.translation()).squaredNorm();
+}
+
+
 // Function to compute Euclidean distance between two poses
 double euclideanDistance(const Pose6D& p1, const Pose6D& p2) {
     return std::sqrt(euclideanDistance2(p1, p2));
+}
+
+// Function to compute Euclidean distance (squared) between two poses
+double euclideanDistance(const Isometry3d& T1, const Isometry3d& T2) {
+    return (T1.translation() - T2.translation()).norm();
 }
 
 double euclideanDistance(const nav_msgs::Odometry::ConstPtr p1, const nav_msgs::Odometry::ConstPtr p2){
@@ -295,17 +337,10 @@ void saveOdometryVerticesKITTIformat(std::string _filename)
 {
     // ref from gtsam's original code "dataset.cpp"
     std::fstream stream(_filename.c_str(), std::fstream::out);
-    for(const auto& _pose6d: keyframePoses) {
-        gtsam::Pose3 pose = Pose6DtoGTSAMPose3(_pose6d);
-        Point3 t = pose.translation();
-        Rot3 R = pose.rotation();
-        auto col1 = R.column(1); // Point3
-        auto col2 = R.column(2); // Point3
-        auto col3 = R.column(3); // Point3
-
-        stream << col1.x() << " " << col2.x() << " " << col3.x() << " " << t.x() << " "
-               << col1.y() << " " << col2.y() << " " << col3.y() << " " << t.y() << " "
-               << col1.z() << " " << col2.z() << " " << col3.z() << " " << t.z() << std::endl;
+    for(const auto& Ti: keyframePoses) {
+        stream << Ti(0,0) << " " << Ti(0,1) << " " << Ti(0,2) << " " << Ti(0,3) << " "
+               << Ti(1,0) << " " << Ti(1,1) << " " << Ti(1,2) << " " << Ti(1,3) << " "
+               << Ti(2,0) << " " << Ti(2,1) << " " << Ti(2,2) << " " << Ti(2,3) << std::endl;
     }
 }
 
@@ -455,13 +490,23 @@ void imuCallback(const sensor_msgs::Imu::ConstPtr& msg)
         IMUAccelBuf.pop_front();
 }
 
- // Callback to store heading samples in a circular buffer.
- void headingCallback(const std_msgs::Float64::ConstPtr& msg)
- {
-    headingBuf.push_back(msg->data);
+// Push headings into buffer
+void headingCallback( const std_msgs::Float64& msg ){
+    headingBuf.push_back(msg.data * M_PI / 180.0);
     if (headingBuf.size() > maxCalBufferSize)
         headingBuf.pop_front();
- }
+}
+
+ // Callback to store heading samples in a circular buffer.
+//  void magnetometerCallback(const sensor_msgs::MagneticField::ConstPtr& msg)
+//  {
+//     Vector3d mag(   msg->magnetic_field.x,
+//                     msg->magnetic_field.y,
+//                     msg->magnetic_field.z);
+//     magnetometerBuf.push_back(mag);
+//     if (magnetometerBuf.size() > maxCalBufferSize)
+//         magnetometerBuf.pop_front();
+//  }
 
 
 Pose6D getOdom(nav_msgs::Odometry::ConstPtr _odom)
@@ -494,79 +539,88 @@ Eigen::Isometry3d odometryToIsometry(const nav_msgs::Odometry& odom) {
 }
 
 /**
- * poseDistance: Computes the linear and angular distance between two poses
+ * poseDistance: Computes the linear and angular distance of a transform
  */
-std::pair<double, double> poseDistance(const Pose6D& _p1)
+std::pair<double, double> poseDistance(const Affine3d& Tdelta)
 {
-    Affine3f Tdelta = pcl::getTransformation(_p1.x, _p1.y, _p1.z, _p1.roll, _p1.pitch, _p1.yaw);
-
     double linear_distance = Tdelta.translation().norm();
-    Eigen::AngleAxisf angle_axis(Tdelta.rotation());
+    Eigen::AngleAxisd angle_axis(Tdelta.rotation());
     double angular_distance = std::abs(angle_axis.angle());
 
     return std::pair<double, double>(linear_distance, angular_distance);
 }
 
-/**
- * poseDistance: Computes the linear and angular distance between two poses
- */
-std::pair<double, double> poseDistance(const Pose6D& _p1, const Pose6D& _p2)
+std::pair<double, double> poseDistance(const Affine3d& T1, const Affine3d& T2 )
 {
-    Affine3f T1 = pcl::getTransformation(_p1.x, _p1.y, _p1.z, _p1.roll, _p1.pitch, _p1.yaw);
-    Affine3f T2 = pcl::getTransformation(_p2.x, _p2.y, _p2.z, _p2.roll, _p2.pitch, _p2.yaw);
-    Affine3f Tdelta = T1.inverse() * T2;
-
-    double linear_distance = Tdelta.translation().norm();
-    Eigen::AngleAxisf angle_axis(Tdelta.rotation());
-    double angular_distance = std::abs(angle_axis.angle());
-
-    return std::pair<double, double>(linear_distance, angular_distance);
+    return poseDistance(T1.inverse() * T2);
 }
 
-Pose6D diffTransformation(const Pose6D& _p1, const Pose6D& _p2)
-{
-    Eigen::Affine3f SE3_p1 = pcl::getTransformation(_p1.x, _p1.y, _p1.z, _p1.roll, _p1.pitch, _p1.yaw);
-    Eigen::Affine3f SE3_p2 = pcl::getTransformation(_p2.x, _p2.y, _p2.z, _p2.roll, _p2.pitch, _p2.yaw);
-    Eigen::Matrix4f SE3_delta0 = SE3_p1.matrix().inverse() * SE3_p2.matrix();
-    Eigen::Affine3f SE3_delta; SE3_delta.matrix() = SE3_delta0;
-    float dx, dy, dz, droll, dpitch, dyaw;
-    pcl::getTranslationAndEulerAngles (SE3_delta, dx, dy, dz, droll, dpitch, dyaw);
-    // std::cout << "delta : " << dx << ", " << dy << ", " << dz << ", " << droll << ", " << dpitch << ", " << dyaw << std::endl;
-
-    return Pose6D{double(abs(dx)), double(abs(dy)), double(abs(dz)), double(abs(droll)), double(abs(dpitch)), double(abs(dyaw))};
-} // SE3Diff
-
-pcl::PointCloud<PointType>::Ptr local2global(const pcl::PointCloud<PointType>::Ptr &cloudIn, const Pose6D& tf)
+// Transforms a point cloud according to an isometry
+pcl::PointCloud<PointType>::Ptr pointcloudTransform_pcl(const pcl::PointCloud<PointType>::Ptr &pointcloud, const Eigen::Matrix4d T)
 {
     pcl::PointCloud<PointType>::Ptr cloudOut(new pcl::PointCloud<PointType>());
 
-    int cloudSize = cloudIn->size();
+    int cloudSize = pointcloud->size();
     cloudOut->resize(cloudSize);
-
-    Eigen::Affine3f transCur = pcl::getTransformation(tf.x, tf.y, tf.z, tf.roll, tf.pitch, tf.yaw);
+    Matrix4f T_float = T.cast<float>();
     
     int numberOfCores = 16;
     #pragma omp parallel for num_threads(numberOfCores)
     for (int i = 0; i < cloudSize; ++i)
     {
-        const auto &pointFrom = cloudIn->points[i];
-        cloudOut->points[i].x = transCur(0,0) * pointFrom.x + transCur(0,1) * pointFrom.y + transCur(0,2) * pointFrom.z + transCur(0,3);
-        cloudOut->points[i].y = transCur(1,0) * pointFrom.x + transCur(1,1) * pointFrom.y + transCur(1,2) * pointFrom.z + transCur(1,3);
-        cloudOut->points[i].z = transCur(2,0) * pointFrom.x + transCur(2,1) * pointFrom.y + transCur(2,2) * pointFrom.z + transCur(2,3);
+        const auto &pointFrom = pointcloud->points[i];
+        cloudOut->points[i].x = T_float(0,0) * pointFrom.x + T_float(0,1) * pointFrom.y + T_float(0,2) * pointFrom.z + T_float(0,3);
+        cloudOut->points[i].y = T_float(1,0) * pointFrom.x + T_float(1,1) * pointFrom.y + T_float(1,2) * pointFrom.z + T_float(1,3);
+        cloudOut->points[i].z = T_float(2,0) * pointFrom.x + T_float(2,1) * pointFrom.y + T_float(2,2) * pointFrom.z + T_float(2,3);
         cloudOut->points[i].intensity = pointFrom.intensity;
     }
 
     return cloudOut;
 }
 
+// Transforms a point cloud according to an isometry
+// std::vector<Vector3d> pointcloudTransform(const pcl::PointCloud<PointType>::Ptr &pointcloud, const Eigen::Matrix4d T)
+// {
+//     std::vector<Eigen::Vector3d> points;
+
+//     int cloudSize = pointcloud->size();
+//     points.reserve(cloudSize);  // Reserve space for efficiency
+//     Matrix4f T_float = T.cast<float>();
+
+//     float x, y, z;
+    
+//     int numberOfCores = 16;
+//     #pragma omp parallel for num_threads(numberOfCores)
+//     for (int i = 0; i < cloudSize; ++i)
+//     {
+//         const auto &pointFrom = pointcloud->points[i];
+//         x = T_float(0,0) * pointFrom.x + T_float(0,1) * pointFrom.y + T_float(0,2) * pointFrom.z + T_float(0,3);
+//         y = T_float(1,0) * pointFrom.x + T_float(1,1) * pointFrom.y + T_float(1,2) * pointFrom.z + T_float(1,3);
+//         z = T_float(2,0) * pointFrom.x + T_float(2,1) * pointFrom.y + T_float(2,2) * pointFrom.z + T_float(2,3);
+//         intensity = pointFrom.intensity;
+
+//         points.emplace_back(x, y, z);
+//     }
+
+//     return cloudOut;
+// }
+
+
+
+pcl::PointCloud<PointType>::Ptr pointcloudTransform_pcl(const pcl::PointCloud<PointType>::Ptr &pointcloud, const Pose6D& tf)
+{
+    return pointcloudTransform_pcl(pointcloud,
+                        pcl::getTransformation(tf.x, tf.y, tf.z, tf.roll, tf.pitch, tf.yaw).matrix().cast<double>()
+                    );
+}
 
 void publish_lc_markers()
 {
     visualization_msgs::MarkerArray markerArray;
 
     for (size_t i = 0; i < loopClosuresAdded.size(); ++i){
-        auto p1 = keyframePosesUpdated[loopClosuresAdded[i].id1];
-        auto p2 = keyframePosesUpdated[loopClosuresAdded[i].id2];
+        auto T1 = keyframePosesUpdated[loopClosuresAdded[i].id1];
+        auto T2 = keyframePosesUpdated[loopClosuresAdded[i].id2];
 
         // Assume pubMarker is a ros::Publisher advertising on, e.g., "/loop_closure_marker"
         visualization_msgs::Marker marker_nom;
@@ -585,12 +639,12 @@ void publish_lc_markers()
         marker_nom.color.a = 0.4;
 
         geometry_msgs::Point pointA, pointB;
-        pointA.x = p1.x;
-        pointA.y = p1.y;
-        pointA.z = p1.z;
-        pointB.x = p2.x;
-        pointB.y = p2.y;
-        pointB.z = p2.z;
+        pointA.x = T1.translation().x();
+        pointA.y = T1.translation().y();
+        pointA.z = T1.translation().z();
+        pointB.x = T2.translation().x();
+        pointB.y = T2.translation().y();
+        pointB.z = T2.translation().z();
 
         // For LINE_LIST, add each pair of points consecutively
         marker_nom.points.push_back(pointA);
@@ -614,7 +668,8 @@ void publish_lc_markers()
         marker_pred.color.b = 0.0;
         marker_pred.color.a = 1;
 
-        Isometry3d T2 = pose6dToIsometry(p2);
+        // To do: this needs to be updated
+        // This won't update with the graph
         Isometry3d T1_pred = T2 * loopClosuresAdded[i].T;
         geometry_msgs::Point pointA_pred;
         
@@ -680,9 +735,9 @@ void publishGPSPathAndLines()
         // to the corresponding updated keyframe pose.
         if (key >= 0 && key < recentIdxUpdated ) {
             geometry_msgs::Point kfPoint;
-            kfPoint.x = keyframePosesUpdated[key].x;
-            kfPoint.y = keyframePosesUpdated[key].y;
-            kfPoint.z = keyframePosesUpdated[key].z;
+            kfPoint.x = keyframePosesUpdated.at(key).translation().x();
+            kfPoint.y = keyframePosesUpdated.at(key).translation().y();
+            kfPoint.z = keyframePosesUpdated.at(key).translation().z();
 
             blueLineMarker.id = key;
 
@@ -719,17 +774,20 @@ void pubPath( void )
     // message
     for (int node_idx=0; node_idx < recentIdxUpdated; node_idx++) // -1 is just delayed visualization (because sometimes mutexed while adding(push_back) a new one)
     {
-        const Pose6D& pose_est = keyframePosesUpdated.at(node_idx); // updated poses
-        // const gtsam::Pose3& pose_est = isamCurrentEstimate.at<gtsam::Pose3>(node_idx);
+        auto pose_est = keyframePosesUpdated.at(node_idx); // updated poses
+        Quaterniond quat(pose_est.rotation());
 
         nav_msgs::Odometry odomAftPGOthis;
         odomAftPGOthis.header.frame_id = "camera_init";
         odomAftPGOthis.child_frame_id = "/aft_pgo";
         odomAftPGOthis.header.stamp = ros::Time().fromSec(keyframeTimes.at(node_idx));
-        odomAftPGOthis.pose.pose.position.x = pose_est.x;
-        odomAftPGOthis.pose.pose.position.y = pose_est.y;
-        odomAftPGOthis.pose.pose.position.z = pose_est.z;
-        odomAftPGOthis.pose.pose.orientation = tf::createQuaternionMsgFromRollPitchYaw(pose_est.roll, pose_est.pitch, pose_est.yaw);
+        odomAftPGOthis.pose.pose.position.x = pose_est.translation().x();
+        odomAftPGOthis.pose.pose.position.y = pose_est.translation().y();
+        odomAftPGOthis.pose.pose.position.z = pose_est.translation().z();
+        odomAftPGOthis.pose.pose.orientation.x = quat.x();
+        odomAftPGOthis.pose.pose.orientation.y = quat.y();
+        odomAftPGOthis.pose.pose.orientation.z = quat.z();
+        odomAftPGOthis.pose.pose.orientation.w = quat.w();
         odomAftPGO = odomAftPGOthis;
 
         geometry_msgs::PoseStamped poseStampAftPGO;
@@ -766,15 +824,15 @@ void pubPath( void )
         br.sendTransform(tf::StampedTransform(transform, odomAftPGO.header.stamp, "camera_init", "/aft_pgo"));
     }
 
-    
     tf::Transform transform_first;
     tf::Quaternion q_first;
-    auto orientation = tf::createQuaternionMsgFromRollPitchYaw(firstPose.roll, firstPose.pitch, firstPose.yaw);
-    transform_first.setOrigin(tf::Vector3(firstPose.x, firstPose.y, firstPose.z));
-    q_first.setW(orientation.w);
-    q_first.setX(orientation.x);
-    q_first.setY(orientation.y);
-    q_first.setZ(orientation.z);
+    Quaterniond orientation(T0.rotation());
+    
+    transform_first.setOrigin(tf::Vector3(T0.translation().x(), T0.translation().y(), T0.translation().z()));
+    q_first.setW(orientation.w());
+    q_first.setX(orientation.x());
+    q_first.setY(orientation.y());
+    q_first.setZ(orientation.z());
     transform_first.setRotation(q_first);
     br.sendTransform(tf::StampedTransform(transform_first, ros::Time().now(), "camera_init", "/first_pose"));
 
@@ -788,13 +846,7 @@ void updatePoses(void)
     mKF.lock(); 
     for (int node_idx=0; node_idx < int(isamCurrentEstimate.size()); node_idx++)
     {
-        Pose6D& p =keyframePosesUpdated[node_idx];
-        p.x = isamCurrentEstimate.at<gtsam::Pose3>(node_idx).translation().x();
-        p.y = isamCurrentEstimate.at<gtsam::Pose3>(node_idx).translation().y();
-        p.z = isamCurrentEstimate.at<gtsam::Pose3>(node_idx).translation().z();
-        p.roll = isamCurrentEstimate.at<gtsam::Pose3>(node_idx).rotation().roll();
-        p.pitch = isamCurrentEstimate.at<gtsam::Pose3>(node_idx).rotation().pitch();
-        p.yaw = isamCurrentEstimate.at<gtsam::Pose3>(node_idx).rotation().yaw();
+        keyframePosesUpdated.at(node_idx) = Isometry3d(isamCurrentEstimate.at<gtsam::Pose3>(node_idx).matrix());
     }
     mKF.unlock();
 
@@ -807,6 +859,8 @@ void updatePoses(void)
     recentIdxUpdated = int(keyframePosesUpdated.size()) - 1;
 
     mtxRecentPose.unlock();
+
+    // ROS_INFO("Pose 0 pose: %s", IsometryToStr(keyframePosesUpdated.at(0)).c_str());
 } // updatePoses
 
 void runISAM2opt(void)
@@ -830,45 +884,17 @@ void runISAM2opt(void)
     updatePoses();
 }
 
-pcl::PointCloud<PointType>::Ptr transformPointCloud(pcl::PointCloud<PointType>::Ptr cloudIn, gtsam::Pose3 transformIn)
-{
-    pcl::PointCloud<PointType>::Ptr cloudOut(new pcl::PointCloud<PointType>());
-
-    PointType *pointFrom;
-
-    int cloudSize = cloudIn->size();
-    cloudOut->resize(cloudSize);
-
-    Eigen::Affine3f transCur = pcl::getTransformation(
-                                    transformIn.translation().x(), transformIn.translation().y(), transformIn.translation().z(), 
-                                    transformIn.rotation().roll(), transformIn.rotation().pitch(), transformIn.rotation().yaw() );
-    
-    int numberOfCores = 8; // TODO move to yaml 
-    #pragma omp parallel for num_threads(numberOfCores)
-    for (int i = 0; i < cloudSize; ++i)
-    {
-        pointFrom = &cloudIn->points[i];
-        cloudOut->points[i].x = transCur(0,0) * pointFrom->x + transCur(0,1) * pointFrom->y + transCur(0,2) * pointFrom->z + transCur(0,3);
-        cloudOut->points[i].y = transCur(1,0) * pointFrom->x + transCur(1,1) * pointFrom->y + transCur(1,2) * pointFrom->z + transCur(1,3);
-        cloudOut->points[i].z = transCur(2,0) * pointFrom->x + transCur(2,1) * pointFrom->y + transCur(2,2) * pointFrom->z + transCur(2,3);
-        cloudOut->points[i].intensity = pointFrom->intensity;
-    }
-    return cloudOut;
-} // transformPointCloud
-
 void loopFindNearKeyframesCloud( pcl::PointCloud<PointType>::Ptr& nearKeyframes, const int& key, const int& submap_size)
 {
     // extract and stacking near keyframes (in global coord)
     nearKeyframes->clear();   
     for (int i = -submap_size; i <= submap_size; ++i) {
         int keyNear = key + i;
-        // if (keyNear < 0 || keyNear >= int(keyframeLaserClouds.size()) )
-        //     continue;
         if (keyNear < 0 || keyNear >= recentIdxUpdated )
             continue;
 
         mKF.lock(); 
-        *nearKeyframes += * local2global(keyframeLaserClouds[keyNear], keyframePosesUpdated[keyNear]);
+        *nearKeyframes += * pointcloudTransform_pcl(keyframeLaserClouds.at(keyNear), keyframePosesUpdated.at(keyNear).matrix());
         mKF.unlock(); 
     }
 
@@ -879,8 +905,8 @@ void loopFindNearKeyframesCloud( pcl::PointCloud<PointType>::Ptr& nearKeyframes,
     // this more efficiently within the algorithm itself.
     if(loopClosureMethod != "small_gicp" && loopClosureMethod != "small_vgicp"){
         pcl::PointCloud<PointType>::Ptr cloud_temp(new pcl::PointCloud<PointType>());  
-        downSizeFilterICP.setInputCloud(nearKeyframes);
-        downSizeFilterICP.filter(*cloud_temp);
+        voxelFilterICP.setInputCloud(nearKeyframes);
+        voxelFilterICP.filter(*cloud_temp);
         *nearKeyframes = *cloud_temp;
     }
 } // loopFindNearKeyframesCloud
@@ -911,7 +937,7 @@ pcl::PointCloud<pcl::PointXYZ>::Ptr eigenToPcl(const std::shared_ptr<small_gicp:
 
 // SL: Compute the relative pose between two key frame indicies 
 // SL: Modified to return the noise model as well   
-std::optional<std::pair<gtsam::Pose3, gtsam::noiseModel::Base::shared_ptr>> doICPVirtualRelative( int _loop_kf_idx, int _curr_kf_idx )
+std::optional<std::pair<gtsam::Pose3, gtsam::noiseModel::Base::shared_ptr>> icp( int _loop_kf_idx, int _curr_kf_idx )
 {
     // SL: Define point clouds
     pcl::PointCloud<PointType>::Ptr currKeyframeCloud(new pcl::PointCloud<PointType>());
@@ -1017,7 +1043,7 @@ std::optional<std::pair<gtsam::Pose3, gtsam::noiseModel::Base::shared_ptr>> doIC
         settings.max_correspondence_distance = ICPMaxCorrespondenceDistance;  // Maximum correspondence distance between points (e.g., triming threshold)
         settings.voxel_resolution = 1.0;
         settings.max_iterations = 50;
-        settings.downsampling_resolution = voxelizationLeafSizeICP;
+        settings.downsampling_resolution = voxelLeafSizeICP;
         if (loopClosureMethod == "small_gicp") settings.type = small_gicp::RegistrationSetting::RegistrationType::GICP;
         else if(loopClosureMethod == "small_vgicp") settings.type = small_gicp::RegistrationSetting::RegistrationType::VGICP;
         else ROS_ERROR("Invalid small_gicp method: %s", loopClosureMethod.c_str());
@@ -1059,7 +1085,7 @@ std::optional<std::pair<gtsam::Pose3, gtsam::noiseModel::Base::shared_ptr>> doIC
 
     // Return both the relative pose and the noise model
     return std::make_pair(betweenPose, loopNoise);
-} // doICPVirtualRelative
+} // icp
 
 Matrix3d calibrateOrientation()
 {
@@ -1069,80 +1095,100 @@ Matrix3d calibrateOrientation()
         return Matrix3d::Identity();
     }
 
-    // Average the heading samples.
-    double sum_heading = 0.0;
-    for (double h : headingBuf) sum_heading += h;
+    // const std::string wmm_model = "wmm2020"; // Ensure you have this model downloaded
+    // GeographicLib::MagneticModel magModel(wmm_model);
+    // double lat = 59.91273; double lon = 10.74609; double year=2025;
+    // double Bx, By, Bz; // Magnetic field components
+    // magModel(lat, lon, 0.0, year, Bx, By, Bz);
+
+    // // Compute the declination (magnetic variation)
+    // double declination = std::atan2(By, Bx) * 180.0 / M_PI; // Convert radians to degrees
+    // ROS_INFO("Magnetic Declination: %f degrees. Field is [%f, %f, %f]", declination, Bx, By, Bz);
+    // declination = 4. + 46./60;
+
+    // Convert raw magnetometer reading to heading (magnetic north)
+    // Vector3d sum_mag = Vector3d::Zero();
+    // for (const auto& mag : magnetometerBuf) sum_mag += mag;
+    // Vector3d avg_mag = sum_mag / magnetometerBuf.size();
+    // double heading_magnetic = std::atan2(avg_mag(1), avg_mag(0)) * 180.0 / M_PI;
+    // ROS_INFO("Heading (magnetic): %f degrees", heading_magnetic);
+    
+    // double heading_true = heading_magnetic + declination;
+    // ROS_INFO("Heading (true): %f degrees", heading_true);
+    
+    double sum_heading = 0;
+    for (const auto& heading : headingBuf) sum_heading += heading;
     double avg_heading = sum_heading / headingBuf.size();
 
     // Average the acceleration samples.
-    Eigen::Vector3d sum_accel = Eigen::Vector3d::Zero();
+    Vector3d sum_accel = Vector3d::Zero();
     for (const auto& accel : IMUAccelBuf) sum_accel += accel;
-    Eigen::Vector3d avg_accel = sum_accel / IMUAccelBuf.size();
+    Vector3d avg_accel = sum_accel / IMUAccelBuf.size();
 
     // Normalize the average acceleration to obtain the "up" vector.
-    Eigen::Vector3d up = avg_accel.normalized();
+    Vector3d up = avg_accel.normalized();
 
     // Construct the desired horizontal y-axis from the average heading.
     // For a heading of 0, assume true north corresponds to (0, 1, 0).
-    Eigen::Vector3d y_desired(std::sin(avg_heading), std::cos(avg_heading), 0.0);
+    Vector3d y_desired(std::sin(avg_heading), std::cos(avg_heading), 0.0);
     y_desired.normalize();
 
     // Project y_desired onto the horizontal plane orthogonal to up.
-    Eigen::Vector3d y_aligned = y_desired - (y_desired.dot(up)) * up;
+    Vector3d y_aligned = y_desired - (y_desired.dot(up)) * up;
     y_aligned.normalize();
 
     // Compute the x-axis as the cross product of y_aligned and up.
-    Eigen::Vector3d x_axis = y_aligned.cross(up).normalized();
+    Vector3d x_axis = y_aligned.cross(up).normalized();
 
     // Build a rotation matrix with the computed orthonormal basis.
-    Eigen::Matrix3d R;
+    Matrix3d R;
     // Columns: x_axis, y_aligned, up (z-axis)
     R.col(0) = x_axis;
     R.col(1) = y_aligned;
     R.col(2) = up;
-
-    // Matrix3d R_ref;
-    // R_ref <<    -0.345734, -0.938296, 0.00825176,
-    //             0.924963, -0.342274, -0.165203,
-    //             0.157834, -0.0494838, 0.986225;
-
-    // Convert the rotation matrix to a quaternion.
-    // Eigen::Quaterniond orientation(R);
-    // orientation.normalize();
-
-    // ROS_INFO("Calibration result:");
-    // ROS_INFO("Average heading: %f rad", avg_heading);
-    // ROS_INFO("Average acceleration (up vector): [%f, %f, %f]",
-    //         avg_accel.x(), avg_accel.y(), avg_accel.z());
-    // ROS_INFO("Computed orientation:");
-    // cout << R << endl;
-    // ROS_INFO("Reference orientation:");
-    // cout << R_ref << endl;
 
     return R;
 }
 
 // Push a pose and pointcloud into the storage queue
 // Also add to scancontext, and handle downsampling
-void push_keyframe(const Pose6D &pose, pcl::PointCloud<PointType>::Ptr &pointcloud, double time)
+void push_keyframe(const Isometry3d &T, pcl::PointCloud<PointType>::Ptr &pointcloud, double time)
 {
-    // Downsample input point cloud from pointcloud_curr according to voxel
-    pcl::PointCloud<PointType>::Ptr pointcloud_downsampled(new pcl::PointCloud<PointType>());
-    downSizeFilterScancontext.setInputCloud(pointcloud);
-    downSizeFilterScancontext.filter(*pointcloud_downsampled);
+    // Downsample input point cloud from pointcloud_curr according to voxel for SC
+    ROS_INFO("Doing scancontext downsample");
+    pcl::PointCloud<PointType>::Ptr pointcloud_downsampled_sc(new pcl::PointCloud<PointType>());
+    voxelFilterScanContext.setInputCloud(pointcloud);
+    voxelFilterScanContext.filter(*pointcloud_downsampled_sc);
+    
+    // Downsample input point cloud from pointcloud_curr according to voxel for saving
+    ROS_INFO("Doing saving downsample");
+    pcl::PointCloud<PointType>::Ptr pointcloud_downsampled_save(new pcl::PointCloud<PointType>());
+    if(voxelLeafSizeSave > 0){
+        voxelFilterSave.setInputCloud(pointcloud);
+        voxelFilterSave.filter(*pointcloud_downsampled_save);
+    }else{
+        * pointcloud_downsampled_save = * pointcloud;
+    }
+
+    // Downsample for visualization
+    ROS_INFO("Doing viz downsample (local)");
+    pcl::PointCloud<PointType>::Ptr pointcloud_downsampled_viz(new pcl::PointCloud<PointType>());
+    voxelFilterMapViz.setInputCloud(pointcloud);
+    voxelFilterMapViz.filter(*pointcloud_downsampled_viz);
     
     // push into queue
     mKF.lock(); 
-    keyframeLaserClouds.push_back(pointcloud_downsampled);
-    keyframePoses.push_back(pose);
-    keyframePosesUpdated.push_back(pose); // init
+    keyframeLaserClouds.push_back(pointcloud_downsampled_save);
+    keyframeLaserCloudsViz.push_back(pointcloud_downsampled_viz);
+    keyframePoses.push_back(T);
+    keyframePosesUpdated.push_back(T); // init
     keyframeTimes.push_back(time);
-    scManager.makeAndSaveScancontextAndKeys(*pointcloud_downsampled);
+    scManager.makeAndSaveScancontextAndKeys(*pointcloud_downsampled_sc);
     mKF.unlock(); 
 }
 
 // Finds a GPS message that arrived within a certain amount of time
-std::optional<nav_msgs::Odometry::ConstPtr> find_recent_gps( double time, double time_delta_allowed = 0.1 )
+std::optional<nav_msgs::Odometry::ConstPtr> find_recent_gps( double time )
 {
     // Lock buffer
     mBufGPS.lock();
@@ -1153,7 +1199,7 @@ std::optional<nav_msgs::Odometry::ConstPtr> find_recent_gps( double time, double
         auto gps_message = gpsBuf.front();
         auto gps_time = gps_message->header.stamp.toSec();
 
-        if( abs(gps_time - time) < time_delta_allowed ) {
+        if( abs(gps_time - time) < gpsTimeDelta ) {
             mBufGPS.unlock();
             return navSatFixToLCOdometry(gps_message);
         }
@@ -1192,11 +1238,53 @@ std::optional<std::tuple<double, pcl::PointCloud<PointType>::Ptr, Isometry3d>> p
     fullResBuf.pop();
 
     // Convert the corresponding odometry message into an Eigen::Isometry3d.
-    Eigen::Isometry3d odom_pose_curr = odometryToIsometry(odometryBuf.front());
+    Eigen::Isometry3d T_odom_curr = odometryToIsometry(*odometryBuf.front());
     odometryBuf.pop();
     mBuf.unlock();
 
-    return std::make_tuple(odometry_timestamp, pointcloud, odom_pose_curr);
+    return std::make_tuple(odometry_timestamp, pointcloud, T_odom_curr);
+}
+
+// Change the GNSS measurement into a Graph Factor.
+std::optional<gtsam::GPSFactor> getGNSSFactor(double odometry_timestamp)
+{
+    // Declare static variable
+    static std::optional<nav_msgs::Odometry::ConstPtr> last_gps;
+    int curr_node_idx = keyframePoses.size() - 1;
+
+    auto current_gps = find_recent_gps(odometry_timestamp);
+
+    // If no gps, exit
+    if(! current_gps) return std::nullopt;
+
+    // If covariance is too high, exit
+    if(current_gps.value()->pose.covariance[0] > gpsCovThr || current_gps.value()->pose.covariance[7] > gpsCovThr) return std::nullopt;
+
+    // If it hasn't been very far from the previous GPS, exit
+    if(last_gps && euclideanDistance(last_gps.value(), current_gps.value()) < gpsDistThr) return std::nullopt;
+
+    last_gps = current_gps;
+
+    // Build gtsam pose and noise
+    gtsam::Point3 gpsConstraint(current_gps.value()->pose.pose.position.x, current_gps.value()->pose.pose.position.y, current_gps.value()->pose.pose.position.z);
+    gtsam::Vector gps_noise(3);
+    gps_noise << current_gps.value()->pose.covariance[0], current_gps.value()->pose.covariance[7], current_gps.value()->pose.covariance[14];
+    gps_noise *= (gpsScale*gpsScale); // Scale by square of scaling factro
+    gps_noise(2) *= (gpsScaleZ*gpsScaleZ); // Further scale the z-factor by the scaling factor squared.
+
+    // Adjust noise on z-vector if not using GPS altitude
+    if(!useGPSElevation) gps_noise(2) = 1e6; // OR 1e10
+
+    // At first iteration, artificially reduce the gps noise to lock the map in place.
+    if(keyframeGpsFactor.size() == 0) gps_noise *= 1e-6;
+
+    // Build gps factor
+    noiseModel::Diagonal::shared_ptr gps_noise_Model = noiseModel::Diagonal::Variances(gps_noise);
+
+    // Log the GPS measurement
+    gpsPointLog.push_back(GPSPoint{curr_node_idx, gpsConstraint.vector()});
+
+    return gtsam::GPSFactor(curr_node_idx, gpsConstraint, gps_noise_Model);
 }
 
 void process_pg()
@@ -1216,29 +1304,26 @@ void process_pg()
 		while ( !odometryBuf.empty() && !fullResBuf.empty() )
         {
             // Get buffer values, or break if there isn't valid data
-            if(! auto bufferResult = popBuffer()) break;
-            auto [odometry_timestamp, pointcloud_curr, odom_pose_curr] = *bufferResult;            
+            auto bufferResult = popBuffer();
+            if(!bufferResult) break;
+            auto [odometry_timestamp, pointcloud_curr, T_odom_curr] = *bufferResult;            
 
             // If it's the first time this is run, set the "first" pose.
             if(keyframePoses.empty()){
                 
                 // Get first odometry pose (use this to convert to relative measurements later)
-                odom_pose_prev = odom_pose_curr;
-
-                // Estimate the correct orientation frame to align with GNSS
-                calibratedInitialRotation = calibrateOrientation();
-                Vector3d rpy = calibratedInitialRotation.eulerAngles(2, 1, 0);
+                T_odom_prev = T_odom_curr;
 
                 // Make the "first pose" from the orientation and position
-                // firstPose = Pose6D{0, 0, 0, rpy[0], rpy[1], rpy[2]};
-                // Or, take it from the first LIO pose
-                firstPose = odom_pose_prev;
+                T0 = Isometry3d::Identity();
+                T0.linear() = calibrateOrientation();
 
                 // Add keyframe to queue
-                push_keyframe(firstPose, pointcloud_curr, odometry_timestamp);
+                push_keyframe(T0, pointcloud_curr, odometry_timestamp);
 
                 // Add the prior factor to the graph
-                gtsam::Pose3 poseOrigin = Pose6DtoGTSAMPose3(firstPose);
+                gtsam::Pose3 poseOrigin(T0.matrix());
+
                 mtxPosegraph.lock();  
                 {
                     // prior factor 
@@ -1251,131 +1336,85 @@ void process_pg()
                 }   
                 mtxPosegraph.unlock();
                 gtSAMgraphMade = true; 
-                ROS_INFO("Initialized graph with prior factor: {x: %.4g, y: %.4g, z: %.4g, r: %.4g, p: %.4g, y: %.4g", firstPose.x, firstPose.y, firstPose.z, firstPose.roll, firstPose.pitch, firstPose.yaw);
+                ROS_INFO("Initialized graph with prior factor: %s", IsometryToStr(T0).c_str());
                 continue;
             }
 
             // Compute current pose
+            Isometry3d T_delta = T_odom_prev.inverse() * T_odom_curr;
+
+            // Accumulate points (in previous KF frame)
+            // * inter_kf_pointcloud += * pointcloudTransform_pcl(pointcloud_curr, T_delta.inverse().matrix());
 
             // Early reject by counting local delta movement (for equi-spreated kf drop)
-            // SL (Q): If it's not a key frame, is the laser scan discarded? Shouldn't it be merged, somehow?            
             // Compute distance travelled since previous odometry keyframe
-            auto [linear_distance, angular_distance] = poseDistance(odom_pose_prev, odom_pose_curr);
-            // ROS_INFO("Pose distance: lin: %.3g, rot: %.3g", linear_distance, angular_distance);
+            auto [linear_distance, angular_distance] = poseDistance(T_odom_prev, T_odom_curr);
 
             // Break out of loop if distance travelled is insufficient. Otherwise, reset accumulated travel.
-            if( linear_distance < keyframeMeterGap && angular_distance < keyframeRadGap ) continue;
-
-            // Otherwise, continue. Compute relative transform and reset previous odometry variable
-            Pose6D pose_delta = computeRelativePose(odom_pose_prev, odom_pose_curr);
-            odom_pose_prev = odom_pose_curr;
-
-            // SL: Look for a GPS message corresponding to key frame (as determined be eps)
-            
-            // SL (Q): eps should be a ROS parameter
-            double eps = 0.1; // find a gps topic arrived within eps second 
-            currGPS = find_recent_gps(odometry_timestamp, eps);
+            if( linear_distance < keyframeMeterGap && angular_distance < keyframeRadGap ){
+                // if skipping, save the point cloud data and transform
+                inter_kf_pointclouds.emplace_back(T_odom_curr, pointcloud_curr);
+                continue;
+            }
 
             // Compute the "estimated" pose from LIO
-            Pose6D odom_pose = applyRelativePose(keyframePoses.back(), pose_delta);
-            // ROS_INFO("Next pose: {x: %.4g, y: %.4g, z: %.4g, r: %.4g, p: %.4g, y: %.4g", odom_pose.x, odom_pose.y, odom_pose.z, odom_pose.roll, odom_pose.pitch, odom_pose.yaw);
+            Isometry3d T_kf_curr = keyframePoses.back() * T_delta;
                         
+            // Accumulate previous pointclouds into the current frame while transforming
+            for(const auto& [T_i, pointcloud_i] : inter_kf_pointclouds){
+                *pointcloud_curr += *pointcloudTransform_pcl(pointcloud_i, (T_i.inverse()*T_odom_curr).inverse().matrix());
+            }
+
             // Store downsampled data to vectors of laser clouds, poses, and timestamps
-            // Old
-            push_keyframe(odom_pose_curr, pointcloud_curr, odometry_timestamp);
-            // New
-            // push_keyframe(odom_pose, pointcloud_curr, odometry_timestamp);
+            push_keyframe(T_kf_curr, pointcloud_curr, odometry_timestamp);
 
-            // SL: Get indicies of keyframes (current and previous)
+            // Reset previous odometry variable  and clear inter_kf_pointlcoud
+            T_odom_prev = T_odom_curr;
+            inter_kf_pointclouds.clear();
+
+            // Get indicies of keyframes (current and previous)
             const int prev_node_idx = keyframePoses.size() - 2; 
-            const int curr_node_idx = keyframePoses.size() - 1; // becuase cpp starts with 0 (actually this index could be any number, but for simple implementation, we follow sequential indexing)
+            const int curr_node_idx = keyframePoses.size() - 1;
 
-            // if( ! gtSAMgraphMade /* prior node */) {
-            //     // SL: If graph is not made, initialize it with the origin pose
-            //     const int init_node_idx = 0; 
-            //     // gtsam::Pose3 poseOrigin = Pose6DtoGTSAMPose3(keyframePoses.at(init_node_idx));
-            //     // auto poseOrigin = gtsam::Pose3(gtsam::Rot3::RzRyRx(0.0, 0.0, 0.0), gtsam::Point3(0.0, 0.0, 0.0));
-            //     auto poseOrigin = gtsam::Pose3(gtsam::Rot3(calibratedInitialRotation), gtsam::Point3(0.0, 0.0, 0.0));
+            ROS_DEBUG("Pose %d:     %s", curr_node_idx, IsometryToStr(keyframePoses.at(curr_node_idx)).c_str());
+            ROS_DEBUG("Odometry %d: %s", curr_node_idx, IsometryToStr(T_odom_curr).c_str());
 
-            //     mtxPosegraph.lock();  
-            //     {
-            //         // prior factor 
-                    
-            //         noiseModel::Diagonal::shared_ptr priorNoise =
-            //         noiseModel::Diagonal::Sigmas(
-            //             (Vector(6) << 1e-1, 1e-1, 3, 1e2, 1e2, 1e2)
-            //             .finished()); // rad, meter
-            //         initialEstimate.insert(init_node_idx, poseOrigin);
-            //         gtSAMgraph.add(gtsam::PriorFactor<gtsam::Pose3>(init_node_idx, poseOrigin, priorNoise));
-            //         runISAM2opt();          
-            //     }   
-            //     mtxPosegraph.unlock();
-            //     gtSAMgraphMade = true;
-            ROS_INFO("Pose %d:     {x: %.4g, y: %.4g, z: %.4g, r: %.4g, p: %.4g, y: %.4g", curr_node_idx, keyframePoses.at(curr_node_idx).x, keyframePoses.at(curr_node_idx).y, keyframePoses.at(curr_node_idx).z, keyframePoses.at(curr_node_idx).roll, keyframePoses.at(curr_node_idx).pitch, keyframePoses.at(curr_node_idx).yaw);
-            
-            ROS_INFO("Odometry %d: {x: %.4g, y: %.4g, z: %.4g, r: %.4g, p: %.4g, y: %.4g", curr_node_idx, odom_pose_curr.x, odom_pose_curr.y, odom_pose_curr.z, odom_pose_curr.roll, odom_pose_curr.pitch, odom_pose_curr.yaw);
-
-            // }else 
             if (keyframePoses.size() <= 1){
                 ROS_ERROR("Error with keyframe sizes. This should not happen.");
                 break;
             }
             
             // Get odometry poses and noise
-            // auto poseBetween = Pose6DtoGTSAMPose3(pose_delta);
+            gtsam::Pose3 poseBetween(T_delta.matrix());
             auto odomNoise = noiseModel::Diagonal::Sigmas(
                 (Vector(6) << noiseLIORotational, noiseLIORotational, noiseLIORotational, noiseLIOLinear, noiseLIOLinear, noiseLIOLinear)
                 .finished());
 
-            auto poseFrom = Pose6DtoGTSAMPose3(keyframePoses.at(prev_node_idx));
-            auto poseTo = Pose6DtoGTSAMPose3(keyframePoses.at(curr_node_idx));
+            gtsam::Pose3 poseFrom(keyframePoses.at(prev_node_idx).matrix());
+            gtsam::Pose3 poseTo(keyframePoses.at(curr_node_idx).matrix());
+
+            // Get GNSS Measurements
+            auto gnss_factor = getGNSSFactor(odometry_timestamp);
 
             mtxPosegraph.lock();
             {
                 // odom factor
-                // Old
-                gtSAMgraph.add(gtsam::BetweenFactor<gtsam::Pose3>(prev_node_idx, curr_node_idx, poseFrom.between(poseTo), odomNoise));
-                // New
-                // gtSAMgraph.add(gtsam::BetweenFactor<gtsam::Pose3>(prev_node_idx, curr_node_idx, poseBetween, odomNoise));
-                initialEstimate.insert(curr_node_idx, Pose6DtoGTSAMPose3(keyframePoses.at(curr_node_idx)));                
+                gtSAMgraph.add(gtsam::BetweenFactor<gtsam::Pose3>(prev_node_idx, curr_node_idx, poseBetween, odomNoise));
+                initialEstimate.insert(curr_node_idx, poseTo);        
 
-                // Process the gps points if: this keyframe has a gps measurement, the covariances are within threshold, and the distance from the previous gps measurement is over a threshold (or the last gps measurement did exist)
-                if (currGPS &&
-                    (currGPS.value()->pose.covariance[0] < gpsCovThr && currGPS.value()->pose.covariance[7] < gpsCovThr) &&
-                    (!lastGPS || euclideanDistance(lastGPS.value(), currGPS.value()) > gpsDistThr))
-                { 
-                    lastGPS = currGPS;
-                
-                    gtsam::Point3 gpsConstraint(currGPS.value()->pose.pose.position.x, currGPS.value()->pose.pose.position.y, currGPS.value()->pose.pose.position.z);
-                    gtsam::Vector gps_noise(3);
-                    gps_noise << currGPS.value()->pose.covariance[0], currGPS.value()->pose.covariance[7], currGPS.value()->pose.covariance[14];
-                    gps_noise *= (gpsScale*gpsScale); // Scale by square of scaling factro
-                    gps_noise(2) *= (gpsScaleZ*gpsScaleZ); // Further scale the z-factor by the scaling factor squared.
-
-                    // Adjust noise on z-vector if not using GPS altitude
-                    if(!useGPSElevation) gps_noise(2) = 1e6; // OR 1e10
-
-                    // At first iteration, artificially reduce the gps noise to lock the map in place.
-                    if(keyframeGpsFactor.size() == 0) gps_noise *= 1e-6;
-
-                    // Build gps factor
-                    noiseModel::Diagonal::shared_ptr gps_noise_Model = noiseModel::Diagonal::Variances(gps_noise);
-                    gtsam::GPSFactor curr_gps_factor = gtsam::GPSFactor(curr_node_idx, gpsConstraint, gps_noise_Model);
-                
-                    // Log the GPS measurement
-                    gpsPointLog.push_back(GPSPoint{curr_node_idx, gpsConstraint.vector()});
-
+                // Insert GPS factor, if it's valid
+                if (gnss_factor){
                     if(gpsInit){
-                        // GPS is already initalized, just add it normally
-                        gtSAMgraph.add(curr_gps_factor);
-                        ROS_DEBUG("GPS factor added at node: %d", curr_node_idx);
+                        // GNSS is already initalized, just add it normally
+                        gtSAMgraph.add(gnss_factor.value());
+                        ROS_DEBUG("GNSS factor added at node: %d", curr_node_idx);
                         triggerExtraGraphOptimization = true;
-
+                
                     }else if (keyframeGpsFactor.size() < thrInitGps){
                         // Otherwise, not yet done accumulating GPS factors. Add to vector of factors to apply.
-                        keyframeGpsFactor.push_back(curr_gps_factor);
-                        ROS_DEBUG("Accumulated gps factor: %ld", keyframeGpsFactor.size());
-
+                        keyframeGpsFactor.push_back(gnss_factor.value());
+                        ROS_DEBUG("Accumulated GNSS factor: %ld", keyframeGpsFactor.size());
+                
                     }else{
                         // Othwerwise, it's time to init the GNS measurements!
                         ROS_INFO("Initializing GNSS transform!");
@@ -1386,9 +1425,6 @@ void process_pg()
                         triggerExtraGraphOptimization = true;
                     }
                 }
-
-                // Insert the LIO pose estimate as an initial estimate to the graph
-                // runISAM2opt();
             }
             mtxPosegraph.unlock();
 
@@ -1452,7 +1488,7 @@ void performNearKFClosure(){
         nearKFProcessedId++;
 
         if(lastDetectedLC_id1 >= 0 &&
-            euclideanDistance2(keyframePosesUpdated[nearKFProcessedId], keyframePosesUpdated[lastDetectedLC_id1]) < consecutiveLCMinDistance2){
+            euclideanDistance2(keyframePosesUpdated.at(nearKFProcessedId), keyframePosesUpdated.at(lastDetectedLC_id1)) < consecutiveLCMinDistance2){
              // We're still too close to a previously detected loop closure
              // Skip
              continue;
@@ -1463,14 +1499,14 @@ void performNearKFClosure(){
         for (int j = 0; j < recentIdxUpdated - lcMinStepSeperation; ++j) {
             // If we've already detected a nearby KF (past) for this current keyframe, check that the current frame isn't super close to that one.
             if(lastDetectedLC_id2 >= 0 &&
-               euclideanDistance2(keyframePosesUpdated[j], keyframePosesUpdated[lastDetectedLC_id2]) < consecutiveLCMinDistance2){
+               euclideanDistance2(keyframePosesUpdated.at(j), keyframePosesUpdated.at(lastDetectedLC_id2)) < consecutiveLCMinDistance2){
                 // We're still too close to the previous LC
                 // Skip
                 continue;
             }
 
             // Check if we're within tolerance
-            double distance2 = euclideanDistance2(keyframePosesUpdated[j], keyframePosesUpdated[nearKFProcessedId]);
+            double distance2 = euclideanDistance2(keyframePosesUpdated.at(j), keyframePosesUpdated.at(nearKFProcessedId));
             if (distance2 < lcDistanceThreshold2) {
                 submitLoopClosureCandidate(j, nearKFProcessedId);
                 lastDetectedLC_id1 = nearKFProcessedId;
@@ -1526,19 +1562,17 @@ void process_icp(void)
             const int prev_node_idx = loop_idx_pair.first;
             const int curr_node_idx = loop_idx_pair.second;
             
-            auto relative_pose_optional = doICPVirtualRelative(prev_node_idx, curr_node_idx);
-
-            // SL: Add between factor to graph if valid
-            if(relative_pose_optional) {
-                auto [relative_pose, loopNoise] = relative_pose_optional.value();
+            // Do ICP, add graph factor if valid
+            if(auto relative_pose = icp(prev_node_idx, curr_node_idx)) {
+                auto [Ticp, loopNoise] = relative_pose.value();
 
                 mtxPosegraph.lock();
-                gtSAMgraph.add(gtsam::BetweenFactor<gtsam::Pose3>(prev_node_idx, curr_node_idx, relative_pose, loopNoise));
+                gtSAMgraph.add(gtsam::BetweenFactor<gtsam::Pose3>(prev_node_idx, curr_node_idx, Ticp, loopNoise));
                 triggerExtraGraphOptimization = true;
                 mtxPosegraph.unlock();
 
                 // Add to list of added loop closures
-                loopClosuresAdded.push_back(LoopClosure{curr_node_idx, prev_node_idx, Isometry3d(relative_pose.matrix())});
+                loopClosuresAdded.push_back(LoopClosure{curr_node_idx, prev_node_idx, Isometry3d(Ticp.matrix())});
             } 
         }
 
@@ -1583,20 +1617,21 @@ void process_isam(void)
 // SL: Publishes the global map, optimized from the pose graph
 void pubMap(void)
 {
-    int SKIP_FRAMES = 2; // sparse map visulalization to save computations
+    int SKIP_FRAMES = 1; // sparse map visulalization to save computations
 
     laserCloudMapPGO->clear();
 
     mKF.lock(); 
     // SL: Loop through all elements of keyframePosesUpdates, add the local cloud to the global map cloud
     for (int node_idx=0; node_idx < recentIdxUpdated; node_idx+=SKIP_FRAMES) {
-        *laserCloudMapPGO += *local2global(keyframeLaserClouds[node_idx], keyframePosesUpdated[node_idx]);
+        *laserCloudMapPGO += *pointcloudTransform_pcl(keyframeLaserCloudsViz.at(node_idx), keyframePosesUpdated.at(node_idx).matrix());
     }
     mKF.unlock(); 
 
     // SL: Downsample cloud
-    downSizeFilterMapPGO.setInputCloud(laserCloudMapPGO);
-    downSizeFilterMapPGO.filter(*laserCloudMapPGO);
+    ROS_INFO("Doing visualization downsample");
+    voxelFilterMapViz.setInputCloud(laserCloudMapPGO);
+    voxelFilterMapViz.filter(*laserCloudMapPGO);
 
     // SL: Publish message
     sensor_msgs::PointCloud2 laserCloudMapPGOMsg;
@@ -1637,8 +1672,9 @@ int main(int argc, char **argv)
     pgTimeSaveStream = std::fstream(save_directory + "times.txt", std::fstream::out); 
     pgTimeSaveStream.precision(std::numeric_limits<double>::max_digits10);
     pgScansDirectory = save_directory + "Scans/";
-    (void)system((std::string("exec rm -r ") + pgScansDirectory).c_str());
-    (void)system((std::string("mkdir -p ") + pgScansDirectory).c_str());
+    int ret1 = system((std::string("exec rm -r ") + pgScansDirectory).c_str());
+    int ret2 = system((std::string("mkdir -p ") + pgScansDirectory).c_str());
+    if (ret1!=0 || ret2!=0) ROS_ERROR("Could not reset and create the scan directory %s.", pgScansDirectory.c_str());
 
 	nh.param<double>("keyframe_meter_gap", keyframeMeterGap, 2.0); // pose assignment every k m move 
 	nh.param<double>("keyframe_deg_gap", keyframeDegGap, 10.0); // pose assignment every k deg rot 
@@ -1649,7 +1685,8 @@ int main(int argc, char **argv)
 
 	nh.param<double>("sc_dist_thres", scDistThres, 0.2);  
 	nh.param<double>("sc_max_radius", scMaximumRadius, 80.0); // 80 is recommended for outdoor, and lower (ex, 20, 40) values are recommended for indoor 
-    nh.param<double>("sc_leaf_size_down", filterSC, 0.4); // Scan Context point cloud downsampling
+    nh.param<double>("sc_voxel_leaf_size", voxelLeafSizeScanContext, 0.4); // Scan Context point cloud downsampling
+    nh.param<double>("voxel_leaf_size_save", voxelLeafSizeSave, 0.05); // The downsampling size
 
     //GPS Params
     nh.param<std::string>("gps_topic", gpsTopic, "/mavros/global_position/global"); // Scaling factor to be multiplied with gps Covariance 
@@ -1666,7 +1703,7 @@ int main(int argc, char **argv)
     nh.param<int>("icp_num_keyframes_old", numHistKeyframesIcpOld, 10); // Number of keyframes point cloud to be included in the submap for icp alignment (old keyframe)
     nh.param<int>("icp_num_keyframes_curr", numHistKeyframesIcpCurr, 3); // Number of keyframes point cloud to be included in the submap for icp alignment (current keyframe)
     nh.param<double>("icp_loop_fitness_score_thr", loopIcpFitnessScoreThreshold, 0.3); // ICP's loop fitness score threshold to accept closing a loop (i.e. registration was successful)
-    nh.param<double>("icp_leaf_size_down", voxelizationLeafSizeICP, 0.2); // ICP's downsampling   
+    nh.param<double>("icp_voxel_leaf_size", voxelLeafSizeICP, 0.2); // ICP's downsampling   
     nh.param<double>("loop_noise_score", loopNoiseScore, 0.8); // Loop Noise variance
     nh.param<double>("loop_closure_noise_scale", loopClosureNoiseScale, 1); // Loop Noise variance
     nh.param<double>("icp_max_correspondence_distance", ICPMaxCorrespondenceDistance, 2); // Loop Noise variance
@@ -1681,7 +1718,8 @@ int main(int argc, char **argv)
     lcDistanceThreshold2 = lcDistanceThreshold*lcDistanceThreshold;
     nh.param<double>("consecutive_lc_min_distance", consecutiveLCMinDistance, 5); // Loop Noise variance
     consecutiveLCMinDistance2 = consecutiveLCMinDistance*consecutiveLCMinDistance;
-    
+	nh.param<double>("voxel_leaf_size_viz", voxelLeafSizeViz, 0.4); // pose assignment every k frames 
+
 
     ISAM2Params parameters;
     parameters.relinearizeThreshold = 0.01;
@@ -1691,22 +1729,21 @@ int main(int argc, char **argv)
     scManager.setSCdistThres(scDistThres);
     scManager.setMaximumRadius(scMaximumRadius);
 
-    downSizeFilterScancontext.setLeafSize(filterSC, filterSC, filterSC);
-    downSizeFilterICP.setLeafSize(voxelizationLeafSizeICP, voxelizationLeafSizeICP, voxelizationLeafSizeICP);
-
-	nh.param<double>("mapviz_filter_size", mapVizFilterSize, 0.4); // pose assignment every k frames 
-    downSizeFilterMapPGO.setLeafSize(mapVizFilterSize, mapVizFilterSize, mapVizFilterSize);
+    voxelFilterScanContext.setLeafSize(voxelLeafSizeScanContext, voxelLeafSizeScanContext, voxelLeafSizeScanContext);
+    voxelFilterICP.setLeafSize(voxelLeafSizeICP, voxelLeafSizeICP, voxelLeafSizeICP);
+    voxelFilterSave.setLeafSize(voxelLeafSizeSave, voxelLeafSizeSave, voxelLeafSizeSave);
+    voxelFilterMapViz.setLeafSize(voxelLeafSizeViz, voxelLeafSizeViz, voxelLeafSizeViz);
 
     // SL (Q): Should rename this topic listener to something more generic
 	ros::Subscriber subLaserCloudFullRes = nh.subscribe<sensor_msgs::PointCloud2>("/velodyne_cloud_registered_local", 100, laserCloudFullResHandler);
 	ros::Subscriber subLaserOdometry = nh.subscribe<nav_msgs::Odometry>("/aft_mapped_to_init", 100, laserOdometryHandler);
 	ros::Subscriber subGPS = nh.subscribe<sensor_msgs::NavSatFix>(gpsTopic, 100, gpsHandler);
     
+    // ros::Subscriber subMagnetometer = nh.subscribe("/mavros/imu/mag", 10, magnetometerCallback);
     ros::Subscriber subHeading = nh.subscribe("/mavros/global_position/compass_hdg", 10, headingCallback);
     ros::Subscriber subIMU = nh.subscribe("/mavros/imu/data", 10, imuCallback);
 
 	pubOdomAftPGO = nh.advertise<nav_msgs::Odometry>("/aft_pgo_odom", 100);
-	// pubGPSLocal = nh.advertise<nav_msgs::Odometry>("/pgo/global_position/local", 100);
 	pubOdomRepubVerifier = nh.advertise<nav_msgs::Odometry>("/repub_odom", 100);
 	pubPathAftPGO = nh.advertise<nav_msgs::Path>("/aft_pgo_path", 100);
 	pubMapAftPGO = nh.advertise<sensor_msgs::PointCloud2>("/aft_pgo_map", 100);
