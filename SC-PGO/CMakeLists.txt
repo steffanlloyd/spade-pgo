@@ -17,6 +17,9 @@ find_package(catkin REQUIRED COMPONENTS
   image_transport
   cv_bridge
   tf
+  tf2
+  tf2_ros
+  tf2_geometry_msgs
 )
 
 #find_package(Eigen3 REQUIRED)
@@ -27,6 +30,16 @@ find_package(OpenCV REQUIRED)
 find_package(OpenMP REQUIRED)
 find_package(GTSAM REQUIRED QUIET)
 find_package(small_gicp REQUIRED)
+find_package(tf2 REQUIRED)
+find_package(tf2_ros REQUIRED)
+find_package(tf2_geometry_msgs REQUIRED)
+
+
+catkin_package(
+  CATKIN_DEPENDS geometry_msgs nav_msgs roscpp rospy std_msgs tf tf2 tf2_ros tf2_geometry_msgs
+  DEPENDS EIGEN3 PCL 
+  INCLUDE_DIRS include
+)
 
 include_directories(
   include
@@ -37,13 +50,6 @@ include_directories(
   ${GTSAM_INCLUDE_DIR}
   /usr/include/GeographicLib
 )
-
-catkin_package(
-  CATKIN_DEPENDS geometry_msgs nav_msgs roscpp rospy std_msgs
-  DEPENDS EIGEN3 PCL 
-  INCLUDE_DIRS include
-)
-
 
 # add_executable(ascanRegistration src/scanRegistration.cpp)
 # target_link_libraries(ascanRegistration ${catkin_LIBRARIES} ${PCL_LIBRARIES})
