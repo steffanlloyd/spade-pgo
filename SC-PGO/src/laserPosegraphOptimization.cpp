@@ -117,7 +117,6 @@ double timeLaser = 0.0;
 pcl::PointCloud<PointType>::Ptr laserCloudMapAfterPGO(new pcl::PointCloud<PointType>());
 
 std::vector<pcl::PointCloud<PointType>::Ptr> keyframeLaserClouds; 
-std::vector<pcl::PointCloud<PointType>::Ptr> keyframeLaserCloudsViz; 
 std::vector<Isometry3d> keyframePoses;
 std::vector<Isometry3d> keyframePosesUpdated;
 std::vector<gtsam::GPSFactor> keyframeGpsFactor;
@@ -216,7 +215,6 @@ std::deque<Eigen::Vector3d> IMUAccelBuf;
 std::deque<double> headingBuf;
 const size_t maxCalBufferSize = 10;
 Isometry3d T0 = Isometry3d::Identity();
-double voxelLeafSizeSave;
 
 std::vector<std::pair<Isometry3d, pcl::PointCloud<PointType>::Ptr>> inter_kf_pointclouds;
 
@@ -250,21 +248,8 @@ std::string IsometryToStr(Isometry3d T){
 }
 
 // Function to compute Euclidean distance (squared) between two poses
-double euclideanDistance2(const Pose6D& p1, const Pose6D& p2) {
-    return  (p1.x - p2.x) * (p1.x - p2.x) +
-            (p1.y - p2.y) * (p1.y - p2.y) +
-            (p1.z - p2.z) * (p1.z - p2.z);
-}
-
-// Function to compute Euclidean distance (squared) between two poses
 double euclideanDistance2(const Isometry3d& T1, const Isometry3d& T2) {
     return (T1.translation() - T2.translation()).squaredNorm();
-}
-
-
-// Function to compute Euclidean distance between two poses
-double euclideanDistance(const Pose6D& p1, const Pose6D& p2) {
-    return std::sqrt(euclideanDistance2(p1, p2));
 }
 
 // Function to compute Euclidean distance (squared) between two poses
@@ -283,55 +268,6 @@ double euclideanDistance(const nav_msgs::Odometry::ConstPtr p1, const nav_msgs::
         ( p1->pose.pose.position.z - p2->pose.pose.position.z ) * ( p1->pose.pose.position.z - p2->pose.pose.position.z )
     );
 }
-
-Eigen::Isometry3d pose6dToIsometry(const Pose6D& pose) {
-    Eigen::Isometry3d T = Eigen::Isometry3d::Identity();
-    T.translate(Eigen::Vector3d(pose.x, pose.y, pose.z));
-
-    T.rotate(Eigen::AngleAxisd(pose.yaw, Eigen::Vector3d::UnitZ()) *
-             Eigen::AngleAxisd(pose.pitch, Eigen::Vector3d::UnitY()) *
-             Eigen::AngleAxisd(pose.roll, Eigen::Vector3d::UnitX()));
-    return T;
-}
-
-Pose6D isometryToPose6d( const Isometry3d &pose){
-
-    Eigen::Vector3d t = pose.translation();
-
-    // Extract the rotation as Euler angles (using ZYX order: yaw, pitch, roll).
-    // The eulerAngles() function returns angles in the order specified.
-    Eigen::Vector3d rpy = pose.rotation().eulerAngles(2, 1, 0);
-
-    return Pose6D{t.x(), t.y(), t.z(),  rpy[0], rpy[1], rpy[2]};
-}
-
-// Function that computes the relative pose from p1 to p2.
-Pose6D computeRelativePose(const Pose6D& p1, const Pose6D& p2)
-{
-    // Convert p1 and p2 into transforms.
-    Eigen::Isometry3d T1 = pose6dToIsometry(p1);
-    Eigen::Isometry3d T2 = pose6dToIsometry(p2);
-
-    // Compute the relative transform: T_relative = T1⁻¹ * T2.
-    return isometryToPose6d( T1.inverse() * T2 );
-}
-
-
-// Function that takes an absolute pose and a relative pose,
-// and returns the composed Pose6D.
-Pose6D applyRelativePose(const Pose6D& base, const Pose6D& relative)
-{
-    // Convert base and relative poses to isometries.
-    Eigen::Isometry3d T_base = pose6dToIsometry(base);
-    Eigen::Isometry3d T_relative = pose6dToIsometry(relative);
-
-    return isometryToPose6d( T_base * T_relative );
-}
-
-gtsam::Pose3 Pose6DtoGTSAMPose3(const Pose6D& p)
-{
-    return gtsam::Pose3( gtsam::Rot3::RzRyRx(p.roll, p.pitch, p.yaw), gtsam::Point3(p.x, p.y, p.z) );
-} // Pose6DtoGTSAMPose3
 
 void saveOdometryVerticesKITTIformat(std::string _filename)
 {
@@ -508,20 +444,6 @@ void headingCallback( const std_msgs::Float64& msg ){
 //         magnetometerBuf.pop_front();
 //  }
 
-
-Pose6D getOdom(nav_msgs::Odometry::ConstPtr _odom)
-{
-    auto tx = _odom->pose.pose.position.x;
-    auto ty = _odom->pose.pose.position.y;
-    auto tz = _odom->pose.pose.position.z;
-
-    double roll, pitch, yaw;
-    geometry_msgs::Quaternion quat = _odom->pose.pose.orientation;
-    tf::Matrix3x3(tf::Quaternion(quat.x, quat.y, quat.z, quat.w)).getRPY(roll, pitch, yaw);
-
-    return Pose6D{tx, ty, tz, roll, pitch, yaw}; 
-} // getOdom
-
 // Converts a nav_msgs::Odometry to an Eigen::Isometry3d.
 Eigen::Isometry3d odometryToIsometry(const nav_msgs::Odometry& odom) {
     Eigen::Isometry3d T = Eigen::Isometry3d::Identity();
@@ -578,42 +500,6 @@ pcl::PointCloud<PointType>::Ptr pointcloudTransform_pcl(const pcl::PointCloud<Po
     return cloudOut;
 }
 
-// Transforms a point cloud according to an isometry
-// std::vector<Vector3d> pointcloudTransform(const pcl::PointCloud<PointType>::Ptr &pointcloud, const Eigen::Matrix4d T)
-// {
-//     std::vector<Eigen::Vector3d> points;
-
-//     int cloudSize = pointcloud->size();
-//     points.reserve(cloudSize);  // Reserve space for efficiency
-//     Matrix4f T_float = T.cast<float>();
-
-//     float x, y, z;
-    
-//     int numberOfCores = 16;
-//     #pragma omp parallel for num_threads(numberOfCores)
-//     for (int i = 0; i < cloudSize; ++i)
-//     {
-//         const auto &pointFrom = pointcloud->points[i];
-//         x = T_float(0,0) * pointFrom.x + T_float(0,1) * pointFrom.y + T_float(0,2) * pointFrom.z + T_float(0,3);
-//         y = T_float(1,0) * pointFrom.x + T_float(1,1) * pointFrom.y + T_float(1,2) * pointFrom.z + T_float(1,3);
-//         z = T_float(2,0) * pointFrom.x + T_float(2,1) * pointFrom.y + T_float(2,2) * pointFrom.z + T_float(2,3);
-//         intensity = pointFrom.intensity;
-
-//         points.emplace_back(x, y, z);
-//     }
-
-//     return cloudOut;
-// }
-
-
-
-pcl::PointCloud<PointType>::Ptr pointcloudTransform_pcl(const pcl::PointCloud<PointType>::Ptr &pointcloud, const Pose6D& tf)
-{
-    return pointcloudTransform_pcl(pointcloud,
-                        pcl::getTransformation(tf.x, tf.y, tf.z, tf.roll, tf.pitch, tf.yaw).matrix().cast<double>()
-                    );
-}
-
 void publish_lc_markers()
 {
     visualization_msgs::MarkerArray markerArray;
@@ -651,37 +537,6 @@ void publish_lc_markers()
         marker_nom.points.push_back(pointB);
         
         markerArray.markers.push_back(marker_nom);
-
-        // Publish the predicted marker
-        visualization_msgs::Marker marker_pred;
-        marker_pred.header.frame_id = "camera_init"; // or the frame that your keyframe positions are in
-        marker_pred.header.stamp = ros::Time::now();
-        marker_pred.ns = "loop_closures";
-        marker_pred.id = loopClosuresAdded.size() + i; // You can assign different IDs if you want to publish multiple markers
-        marker_pred.type = visualization_msgs::Marker::LINE_LIST;
-        marker_pred.action = visualization_msgs::Marker::ADD;
-        
-        // Set the line width and colour
-        marker_pred.scale.x = 0.3;
-        marker_pred.color.r = .4;
-        marker_pred.color.g = 0.0;
-        marker_pred.color.b = 0.0;
-        marker_pred.color.a = 1;
-
-        // To do: this needs to be updated
-        // This won't update with the graph
-        Isometry3d T1_pred = T2 * loopClosuresAdded[i].T;
-        geometry_msgs::Point pointA_pred;
-        
-        pointA_pred.x = T1_pred.translation().x();
-        pointA_pred.y = T1_pred.translation().y();
-        pointA_pred.z = T1_pred.translation().z();
-
-        marker_pred.points.push_back(pointB);
-        marker_pred.points.push_back(pointA_pred);
-
-        markerArray.markers.push_back(marker_pred);
-
     }
     // Publish it
     pubMarkerLC.publish(markerArray);
@@ -705,11 +560,11 @@ void publishGPSPathAndLines()
     blueLineMarker.ns = "gps_to_keyframe";
     blueLineMarker.type = visualization_msgs::Marker::LINE_LIST;
     blueLineMarker.action = visualization_msgs::Marker::ADD;
-    blueLineMarker.scale.x = 0.1; // Adjust the line width as needed
+    blueLineMarker.scale.x = 0.05; // Adjust the line width as needed
     blueLineMarker.color.r = 0.0;
     blueLineMarker.color.g = 0.0;
     blueLineMarker.color.b = 1.0;
-    blueLineMarker.color.a = 0.2;
+    blueLineMarker.color.a = 0.05;
 
     // Iterate over all GPS factors.
     for (const auto& pnt : gpsPointLog) {
@@ -1154,32 +1009,19 @@ Matrix3d calibrateOrientation()
 // Also add to scancontext, and handle downsampling
 void push_keyframe(const Isometry3d &T, pcl::PointCloud<PointType>::Ptr &pointcloud, double time)
 {
+    // Downsample for visualization and loop closure
+    pcl::PointCloud<PointType>::Ptr pointcloud_downsampled(new pcl::PointCloud<PointType>());
+    voxelFilterSave.setInputCloud(pointcloud);
+    voxelFilterSave.filter(*pointcloud_downsampled);
+
     // Downsample input point cloud from pointcloud_curr according to voxel for SC
-    ROS_INFO("Doing scancontext downsample");
     pcl::PointCloud<PointType>::Ptr pointcloud_downsampled_sc(new pcl::PointCloud<PointType>());
     voxelFilterScanContext.setInputCloud(pointcloud);
     voxelFilterScanContext.filter(*pointcloud_downsampled_sc);
     
-    // Downsample input point cloud from pointcloud_curr according to voxel for saving
-    ROS_INFO("Doing saving downsample");
-    pcl::PointCloud<PointType>::Ptr pointcloud_downsampled_save(new pcl::PointCloud<PointType>());
-    if(voxelLeafSizeSave > 0){
-        voxelFilterSave.setInputCloud(pointcloud);
-        voxelFilterSave.filter(*pointcloud_downsampled_save);
-    }else{
-        * pointcloud_downsampled_save = * pointcloud;
-    }
-
-    // Downsample for visualization
-    ROS_INFO("Doing viz downsample (local)");
-    pcl::PointCloud<PointType>::Ptr pointcloud_downsampled_viz(new pcl::PointCloud<PointType>());
-    voxelFilterMapViz.setInputCloud(pointcloud);
-    voxelFilterMapViz.filter(*pointcloud_downsampled_viz);
-    
     // push into queue
     mKF.lock(); 
-    keyframeLaserClouds.push_back(pointcloud_downsampled_save);
-    keyframeLaserCloudsViz.push_back(pointcloud_downsampled_viz);
+    keyframeLaserClouds.push_back(pointcloud_downsampled);
     keyframePoses.push_back(T);
     keyframePosesUpdated.push_back(T); // init
     keyframeTimes.push_back(time);
@@ -1624,12 +1466,11 @@ void pubMap(void)
     mKF.lock(); 
     // SL: Loop through all elements of keyframePosesUpdates, add the local cloud to the global map cloud
     for (int node_idx=0; node_idx < recentIdxUpdated; node_idx+=SKIP_FRAMES) {
-        *laserCloudMapPGO += *pointcloudTransform_pcl(keyframeLaserCloudsViz.at(node_idx), keyframePosesUpdated.at(node_idx).matrix());
+        *laserCloudMapPGO += *pointcloudTransform_pcl(keyframeLaserClouds.at(node_idx), keyframePosesUpdated.at(node_idx).matrix());
     }
     mKF.unlock(); 
 
     // SL: Downsample cloud
-    ROS_INFO("Doing visualization downsample");
     voxelFilterMapViz.setInputCloud(laserCloudMapPGO);
     voxelFilterMapViz.filter(*laserCloudMapPGO);
 
@@ -1684,9 +1525,8 @@ int main(int argc, char **argv)
 
 
 	nh.param<double>("sc_dist_thres", scDistThres, 0.2);  
-	nh.param<double>("sc_max_radius", scMaximumRadius, 80.0); // 80 is recommended for outdoor, and lower (ex, 20, 40) values are recommended for indoor 
+	nh.param<double>("sc_max_radius", scMaximumRadius, 25.0); // 80 is recommended for outdoor, and lower (ex, 20, 40) values are recommended for indoor 
     nh.param<double>("sc_voxel_leaf_size", voxelLeafSizeScanContext, 0.4); // Scan Context point cloud downsampling
-    nh.param<double>("voxel_leaf_size_save", voxelLeafSizeSave, 0.05); // The downsampling size
 
     //GPS Params
     nh.param<std::string>("gps_topic", gpsTopic, "/mavros/global_position/global"); // Scaling factor to be multiplied with gps Covariance 
@@ -1704,7 +1544,6 @@ int main(int argc, char **argv)
     nh.param<int>("icp_num_keyframes_curr", numHistKeyframesIcpCurr, 3); // Number of keyframes point cloud to be included in the submap for icp alignment (current keyframe)
     nh.param<double>("icp_loop_fitness_score_thr", loopIcpFitnessScoreThreshold, 0.3); // ICP's loop fitness score threshold to accept closing a loop (i.e. registration was successful)
     nh.param<double>("icp_voxel_leaf_size", voxelLeafSizeICP, 0.2); // ICP's downsampling   
-    nh.param<double>("loop_noise_score", loopNoiseScore, 0.8); // Loop Noise variance
     nh.param<double>("loop_closure_noise_scale", loopClosureNoiseScale, 1); // Loop Noise variance
     nh.param<double>("icp_max_correspondence_distance", ICPMaxCorrespondenceDistance, 2); // Loop Noise variance
     nh.param<int>("icp_ransac_iterations", ICPRANSACIterations, 10); // Loop Noise variance
@@ -1731,6 +1570,7 @@ int main(int argc, char **argv)
 
     voxelFilterScanContext.setLeafSize(voxelLeafSizeScanContext, voxelLeafSizeScanContext, voxelLeafSizeScanContext);
     voxelFilterICP.setLeafSize(voxelLeafSizeICP, voxelLeafSizeICP, voxelLeafSizeICP);
+    double voxelLeafSizeSave = std::min(voxelLeafSizeICP, std::min(voxelLeafSizeScanContext, voxelLeafSizeViz));
     voxelFilterSave.setLeafSize(voxelLeafSizeSave, voxelLeafSizeSave, voxelLeafSizeSave);
     voxelFilterMapViz.setLeafSize(voxelLeafSizeViz, voxelLeafSizeViz, voxelLeafSizeViz);
 
