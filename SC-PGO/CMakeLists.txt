@@ -14,9 +14,6 @@ find_package(catkin REQUIRED COMPONENTS
   rospy
   std_msgs
   tf
-  tf2
-  tf2_ros
-  tf2_geometry_msgs
 )
 
 #find_package(Eigen3 REQUIRED)
@@ -41,7 +38,15 @@ include_directories(
 )
 
 add_executable(laserPGO 
-  src/laserPosegraphOptimization.cpp
+  src/laserPosegraphOptimization_new.cpp
+  src/DataBuffer.cpp
+  src/geometry.cpp
+  src/LoopClosureManager.cpp
+  src/NearKFDetector.cpp
+  src/PoseGraphManager.cpp
+  src/OrientationInitializer.cpp
+  src/ros_helpers.cpp
+  src/Visualizer.cpp
   include/scancontext/Scancontext.cpp
 )
 target_compile_options(laserPGO 

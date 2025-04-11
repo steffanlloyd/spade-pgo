@@ -65,10 +65,8 @@
 #include <GeographicLib/Geocentric.hpp>
 #include <GeographicLib/LocalCartesian.hpp>
 #include <GeographicLib/Geoid.hpp>
-// #include <GeographicLib/MagneticModel.hpp>
 
-#include "scancontext/common.h"
-#include "scancontext/tic_toc.h"
+#include "spade_pgo/common.hpp"
 
 #include "scancontext/Scancontext.h"
 
