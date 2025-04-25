@@ -8,6 +8,7 @@
 #include <omp.h>
 
 #include <small_gicp/points/point_cloud.hpp>
+#include <small_gicp/ann/incremental_voxelmap.hpp>
 
 using namespace spade_pgo;
 
@@ -94,7 +95,7 @@ double spade_pgo::geometry::euclideanDistance(const Eigen::Isometry3d& T1, const
  * @param pcl_cloud The input pcl point cloud.
  * @return The converted Eigen point cloud.
  */
-std::shared_ptr<small_gicp::PointCloud> spade_pgo::geometry::pclToEigen(const pcl::PointCloud<PointType>::Ptr& pcl_cloud) {
+small_gicp::PointCloud::Ptr spade_pgo::geometry::pclToEigen(const pcl::PointCloud<PointType>::Ptr& pcl_cloud) {
     std::vector<Eigen::Vector3d> points;
     points.reserve(pcl_cloud->points.size());  // Reserve space for efficiency
 
@@ -110,7 +111,7 @@ std::shared_ptr<small_gicp::PointCloud> spade_pgo::geometry::pclToEigen(const pc
  * @param eigen_cloud The input Eigen point cloud.
  * @return The converted pcl point cloud.
  */
-pcl::PointCloud<pcl::PointXYZ>::Ptr spade_pgo::geometry::eigenToPcl(const std::shared_ptr<small_gicp::PointCloud> eigen_cloud) {
+pcl::PointCloud<pcl::PointXYZ>::Ptr spade_pgo::geometry::eigenToPcl(const small_gicp::PointCloud::Ptr eigen_cloud) {
     pcl::PointCloud<pcl::PointXYZ>::Ptr pcl_cloud(new pcl::PointCloud<pcl::PointXYZ>());
     pcl_cloud->resize(eigen_cloud->size());
     for (size_t i = 0; i<eigen_cloud->size(); ++i)
@@ -120,4 +121,78 @@ pcl::PointCloud<pcl::PointXYZ>::Ptr spade_pgo::geometry::eigenToPcl(const std::s
         pcl_cloud->points[i].z = eigen_cloud->points[i][2];
     }
     return pcl_cloud;
+}
+
+/**
+ * @brief Converts an IncrementalVoxelMap to a pcl point cloud.
+ * @param voxelmap The input IncrementalVoxelMap.
+ * @param T An optional transform to apply.
+ * @return The converted pcl point cloud.
+ */
+pcl::PointCloud<pcl::PointXYZ>::Ptr spade_pgo::geometry::incrementalVoxelMapToPcl(
+    const std::shared_ptr<small_gicp::IncrementalVoxelMap<small_gicp::FlatContainerNormalCov>>& voxelmap,
+    const std::optional<Eigen::Isometry3d> T)
+{
+    std::vector<Eigen::Vector4d> eigen_points = small_gicp::traits::voxel_points(*voxelmap);
+    
+    pcl::PointCloud<pcl::PointXYZ>::Ptr pcl_cloud(new pcl::PointCloud<pcl::PointXYZ>());
+    pcl_cloud->resize(eigen_points.size());
+    
+    // Because there are a large number of points, do the if
+    // statement outside of the loop to avoid checking it for each point
+    // Even though this results in slightly less clean code.
+    if(T.has_value()){
+        for (size_t i = 0; i < eigen_points.size(); ++i)
+        {
+            eigen_points[i] = (*T) * eigen_points[i];
+            pcl_cloud->points[i].x = eigen_points[i][0];
+            pcl_cloud->points[i].y = eigen_points[i][1];
+            pcl_cloud->points[i].z = eigen_points[i][2];
+        }
+    }else{
+        for (size_t i = 0; i < eigen_points.size(); ++i)
+        {
+            pcl_cloud->points[i].x = eigen_points[i][0];
+            pcl_cloud->points[i].y = eigen_points[i][1];
+            pcl_cloud->points[i].z = eigen_points[i][2];
+        }
+    }
+    
+    return pcl_cloud;
+}
+
+/**
+ * @brief Gets the points from an IncrementalVoxelMap.
+ * @param voxelmap The input IncrementalVoxelMap.
+ * @param T An optional transform to apply.
+ * @return The points in the voxelmap.
+ */
+small_gicp::PointCloud::Ptr spade_pgo::geometry::getPoints(
+    const std::shared_ptr<small_gicp::IncrementalVoxelMap<small_gicp::FlatContainerNormalCov>>& voxelmap,
+    const std::optional<Eigen::Isometry3d>& T)
+{
+    auto points = std::make_shared<small_gicp::PointCloud>(small_gicp::traits::voxel_points(*voxelmap));
+    if (T.has_value()) {
+        for (auto& point : points->points) {
+            point = (*T) * point;
+        }
+    }
+
+    // points->points.reserve(voxelmap->size() * 5);
+    // points->normals.reserve(voxelmap->size() * 5);
+    // points->covs.reserve(voxelmap->size() * 5);
+
+    // for (const auto& voxel : voxelmap->flat_voxels) {
+    //     for (size_t i = 0; i < small_gicp::traits::size(voxel->second); i++) {
+    //         points->points.push_back(small_gicp::traits::point(voxel->second, i));
+            // points->normals.push_back(small_gicp::traits::normal(voxel->second, i));
+            // points->covs.push_back(small_gicp::traits::cov(voxel->second, i));
+    //     }
+    // }
+
+    // points->normals = small_gicp::traits::voxel_normals(*voxelmap);
+    // points->covs = small_gicp::traits::voxel_covs(*voxelmap);
+    // auto points = std::make_shared<small_gicp::PointCloud>();
+    
+    return points;
 }

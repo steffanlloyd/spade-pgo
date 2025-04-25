@@ -61,8 +61,8 @@ PoseGraphManager::PoseGraphManager(
     this->isam_ = gtsam::ISAM2(isam_params);
 
     // Setup voxel filters
-    this->voxelizer_sc_.setLeafSize(this->params->sc.voxel_size, this->params->sc.voxel_size, this->params->sc.voxel_size);
-    double voxel_size_save = std::min(this->params->icp.voxel_size, this->params->sc.voxel_size);
+    // double voxel_size_save = std::min(this->params->icp.voxel_size, this->params->sc.voxel_size);
+    double voxel_size_save = 0.4;
     this->voxelizer_save_.setLeafSize(voxel_size_save, voxel_size_save, voxel_size_save);
 
     // Setup outputs
@@ -97,18 +97,10 @@ int PoseGraphManager::addKeyframe(const Eigen::Isometry3d &T, pcl::PointCloud<Po
 
     ROS_DEBUG("Added keyframe %d, estimated position: %s", kf_id, isometryToStr(T).c_str());
 
-    // Add to scancontext
-    // TO DO: Fix this scancontrol stuff
-    if(this->params->loop_closure.use_scancontrol){
-        // Downsample input point cloud from pointcloud according to voxel for SC
-        pcl::PointCloud<PointType>::Ptr pointcloud_downsampled_sc(new pcl::PointCloud<PointType>());
-        this->voxelizer_sc_.setInputCloud(pointcloud);
-        this->voxelizer_sc_.filter(*pointcloud_downsampled_sc);
-
-        auto loop_closure_manager = this->loop_closure_manager_.lock();
-        if(loop_closure_manager) loop_closure_manager->sc_detector.makeAndSaveScancontextAndKeys(*pointcloud_downsampled_sc);
-        else ROS_ERROR("Loop closure manager is not set. Cannot add scancontext.");
-    }
+    // Submit point clouds to loop closure manager
+    auto loop_closure_manager = this->loop_closure_manager_.lock();
+    if(loop_closure_manager) loop_closure_manager->submitKeyframeCloud(kf_id, T, pointcloud);
+    else ROS_ERROR("Loop closure manager is not set. Cannot add keyframe.");
 
     return kf_id;
 }
@@ -184,6 +176,27 @@ std::vector<Eigen::Isometry3d> PoseGraphManager::getUpdatedKFPoses() const
 }
 
 /**
+ * @brief Returns the corrective transform between the odometry pose and 
+ * the updated pose from the pose graph.align
+ * @param kf_index The index of the keyframe to get the correction for.
+ * @return The corrective transform between the odometry pose and the updated pose.
+ */
+Eigen::Isometry3d PoseGraphManager::getKFCorrection(int kf_index) const
+{
+    std::lock_guard<std::mutex> lock(this->kf_updated_mtx_);
+    if(kf_index < 0 || kf_index >= static_cast<int>(this->kf_poses_updated_.size())){
+        ROS_WARN("Invalid KF index to get correction: %d", kf_index);
+        return Eigen::Isometry3d::Identity();
+    }
+
+    Eigen::Isometry3d T_odom = this->kf_poses_odom_.at(kf_index);
+    Eigen::Isometry3d T_updated = this->kf_poses_updated_.at(kf_index);
+    Eigen::Isometry3d T_correction = T_updated * T_odom.inverse();
+
+    return T_correction;
+}
+
+/**
  * @brief Returns a vector of GNSS points
  */
 std::vector<std::optional<Eigen::Vector3d>> PoseGraphManager::getGNSSPoints() const
@@ -242,7 +255,7 @@ void PoseGraphManager::addPriorFactorandEstimate(const Eigen::Isometry3d &T)
     gtsam::noiseModel::Diagonal::Sigmas((Eigen::VectorXd(6) <<
         this->params->graph.prior_noise_rot,
         this->params->graph.prior_noise_rot,
-        this->params->graph.prior_noise_rot,
+        this->params->graph.prior_noise_rot*50, // we don't know heading very well
         this->params->graph.prior_noise_lin,
         this->params->graph.prior_noise_lin,
         this->params->graph.prior_noise_lin).finished()); // rad, meter
@@ -510,7 +523,6 @@ void PoseGraphManager::processData(DataPoint data)
     Eigen::Isometry3d T_delta = T_odom_prev.inverse() * T_odom;
 
     // Compute the "estimated" pose from LIO
-    // Warning: May be a problem setting current pose so far from the addKeyframe part. Fix?
     Eigen::Isometry3d T_kf = this->kf_poses_odom_.back() * T_delta;
     Eigen::Isometry3d T_kf_updated = this->estimateUpdatedPose(T_kf);
     this->setCurrentPose(T_kf_updated);

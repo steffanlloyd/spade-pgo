@@ -9,6 +9,8 @@
 #include <pcl_conversions/pcl_conversions.h>
 #include <pcl/io/pcd_io.h>
 
+#include <small_gicp/points/point_cloud.hpp>
+
 namespace spade_pgo {
 
 Visualizer::Visualizer(
@@ -27,6 +29,7 @@ Visualizer::Visualizer(
     this->publisher_sensor_cloud_ = nh_.advertise<sensor_msgs::PointCloud2>("/pgo/sensor_cloud", 100);
     this->publisher_lc_cloud_curr_= nh_.advertise<sensor_msgs::PointCloud2>("/pgo/lc_cloud_curr", 100);
     this->publisher_lc_cloud_prev_= nh_.advertise<sensor_msgs::PointCloud2>("/pgo/lc_cloud_prev", 100);
+    this->publisher_test_cloud_ = nh_.advertise<sensor_msgs::PointCloud2>("/pgo/cloud_test", 100);
 
     // Set up voxelizer
     this->voxelizer_map_.setLeafSize(params->visualize.voxel_size, params->visualize.voxel_size, params->visualize.voxel_size);
@@ -172,16 +175,19 @@ void Visualizer::publishSensorCloud(const sensor_msgs::PointCloud2ConstPtr& ros_
 
 /**
  * @brief Publishes the loop closure clouds and saves to a file, if desired
- * @param cloud_curr The current point cloud.
+ * @param points_curr The current point cloud.
  * @param cloud_prev The previous point cloud.
  * @param kf_curr The index of the current keyframe.
  * @param kf_prev The index of the previous keyframe.
  */
 void Visualizer::publishLCClouds(
-    const pcl::PointCloud<PointType>::Ptr& cloud_curr,
-    const pcl::PointCloud<PointType>::Ptr& cloud_prev,
+    small_gicp::PointCloud::Ptr points_curr,
+    small_gicp::PointCloud::Ptr points_prev,
     int kf_curr, int kf_prev)
 {
+    auto cloud_curr = geometry::eigenToPcl( points_curr );
+    auto cloud_prev = geometry::eigenToPcl( points_prev );
+
     // Publishes the point clouds, if applicable
     if(this->params->icp.publish_pointclouds){
         sensor_msgs::PointCloud2 cloud_curr_msg;   
@@ -204,6 +210,18 @@ void Visualizer::publishLCClouds(
         pcl::io::savePCDFileASCII(filename_curr.str(), *cloud_curr);
         pcl::io::savePCDFileASCII(filename_prev.str(), *cloud_prev);
     }
+}
+
+/**
+ * @brief Publishes a test cloud for visualization.
+ */
+void Visualizer::publishTestCloud(const pcl::PointCloud<pcl::PointXYZ>::Ptr& cloud)
+{
+    // Publishes the point clouds, if applicable
+    sensor_msgs::PointCloud2 cloud_msg;   
+    pcl::toROSMsg(*cloud, cloud_msg);
+    cloud_msg.header.frame_id = "camera_init";     
+    this->publisher_test_cloud_.publish(cloud_msg);
 }
 
 void Visualizer::publishLCMarkers()

@@ -5,6 +5,7 @@
 #include <pcl/point_types.h>
 
 #include <small_gicp/points/point_cloud.hpp>
+#include <small_gicp/ann/incremental_voxelmap.hpp>
 
 #include <Eigen/Dense>
 #include <Eigen/Geometry>
@@ -22,8 +23,15 @@ pcl::PointCloud<PointType>::Ptr pclTransform(const pcl::PointCloud<PointType>::P
 double euclideanDistance2(const Eigen::Isometry3d& T1, const Eigen::Isometry3d& T2);
 double euclideanDistance(const Eigen::Isometry3d& T1, const Eigen::Isometry3d& T2);
 
-std::shared_ptr<small_gicp::PointCloud> pclToEigen(const pcl::PointCloud<PointType>::Ptr& pcl_cloud);
-pcl::PointCloud<pcl::PointXYZ>::Ptr eigenToPcl(const std::shared_ptr<small_gicp::PointCloud> eigen_cloud);
+small_gicp::PointCloud::Ptr pclToEigen(const pcl::PointCloud<PointType>::Ptr& pcl_cloud);
+pcl::PointCloud<pcl::PointXYZ>::Ptr eigenToPcl(const small_gicp::PointCloud::Ptr eigen_cloud);
+pcl::PointCloud<pcl::PointXYZ>::Ptr incrementalVoxelMapToPcl(
+    const std::shared_ptr<small_gicp::IncrementalVoxelMap<small_gicp::FlatContainerNormalCov>>& voxelmap,
+    const std::optional<Eigen::Isometry3d> T = std::nullopt);
+    
+small_gicp::PointCloud::Ptr getPoints(
+    const std::shared_ptr<small_gicp::IncrementalVoxelMap<small_gicp::FlatContainerNormalCov>>& voxelmap,
+    const std::optional<Eigen::Isometry3d>& T = std::nullopt);
 
 } // End namespace geometry
 } // End namespace spade_pgo

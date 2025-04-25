@@ -38,6 +38,7 @@ struct PGOParams{
     struct loop_closure{
         bool use_scancontrol;
         bool use_near_kf;
+        double kf_distance;
     } loop_closure;
     struct near_kf{
         double distance_threshold;

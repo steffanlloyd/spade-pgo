@@ -15,6 +15,8 @@
 #include "spade_pgo/PoseGraphManager.hpp"
 #include "spade_pgo/PGOParams.hpp"
 
+#include <small_gicp/points/point_cloud.hpp>
+
 namespace spade_pgo {
 // Forward declaration
 class LoopClosureManager;
@@ -32,9 +34,10 @@ public:
     void publishPath();
     void publishMap(int frame_skip = 1);
     void publishSensorCloud(const sensor_msgs::PointCloud2ConstPtr& cloud);
-    void publishLCClouds(const pcl::PointCloud<PointType>::Ptr& cloud_curr,
-                         const pcl::PointCloud<PointType>::Ptr& cloud_prev,
+    void publishLCClouds(small_gicp::PointCloud::Ptr points_curr,
+                         small_gicp::PointCloud::Ptr points_prev,
                          int kf_curr=-1, int kf_prev=-1);
+    void publishTestCloud(const pcl::PointCloud<pcl::PointXYZ>::Ptr& cloud);
     void publishLCMarkers();
 
     void setLoopClosureManager(std::shared_ptr<LoopClosureManager> lc_manager);
@@ -62,6 +65,7 @@ private:
     ros::Publisher publisher_sensor_cloud_;
     ros::Publisher publisher_lc_cloud_curr_;
     ros::Publisher publisher_lc_cloud_prev_;
+    ros::Publisher publisher_test_cloud_;
 
     tf::TransformBroadcaster tf_broadcaster_;
 

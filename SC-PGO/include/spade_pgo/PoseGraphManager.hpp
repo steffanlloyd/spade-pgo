@@ -51,6 +51,7 @@ public:
     int currentKFIndex() const;
     int graphSize() const;
     std::vector<Eigen::Isometry3d> getUpdatedKFPoses() const;
+    Eigen::Isometry3d getKFCorrection(int kf_index) const;
     std::vector<std::optional<Eigen::Vector3d>> getGNSSPoints() const;
     std::vector<double> getKFTimestamps() const;
     void triggerExtraOptimization();
@@ -107,7 +108,6 @@ private:
 
     std::queue<std::pair<Eigen::Isometry3d, pcl::PointCloud<PointType>::Ptr>> inter_kf_pointcloud_buffer_;
 
-    pcl::VoxelGrid<PointType> voxelizer_sc_;
     pcl::VoxelGrid<PointType> voxelizer_save_;
 
     mutable std::fstream pg_laser_timestamp_save_;

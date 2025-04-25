@@ -150,7 +150,7 @@ int main(int argc, char **argv)
 
     // Graph parameters
 	nh.param<double>("graph_kf_gap_lin", params->graph.kf_gap_lin, 1.0); // Euclidean distance between keyframes (m)
-	nh.param<double>("graph_kf_gap_rot", params->graph.kf_gap_rot, 0.2); // Rotational distance between keyframes (rad)
+	nh.param<double>("graph_kf_gap_rot", params->graph.kf_gap_rot, 0.5); // Rotational distance between keyframes (rad)
     nh.param<double>("graph_lio_noise_lin", params->graph.lio_noise_lin, 1e-3); // Std of noise from LIO (m)
     nh.param<double>("graph_lio_noise_rot", params->graph.lio_noise_rot, 1e-2); // Std of noise from LIO (rad)
     nh.param<double>("graph_prior_noise_lin", params->graph.prior_noise_lin, 5); // Prior noise from gps/imu initial pose estimate (m)
@@ -168,6 +168,7 @@ int main(int argc, char **argv)
     // Loop closure params
     nh.param<bool>("loop_closure_use_scancontrol", params->loop_closure.use_scancontrol, false);
     nh.param<bool>("loop_closure_use_near_kf", params->loop_closure.use_near_kf, false);
+    nh.param<double>("loop_closure_kf_distance", params->loop_closure.kf_distance, 5.0); // Distance between keyframes to be considered for loop closure (m)
 
     // Near KF loop closure commands
     nh.param<double>("near_kf_distance_threshold", params->near_kf.distance_threshold, 10); // Distance that implies a potential match
