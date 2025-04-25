@@ -1,60 +1,63 @@
 <launch>
 
-    <param name="scan_line" type="int" value="4" />
-
-    <!-- if 1, do mapping 10 Hz, if 2, do mapping 5 Hz. Suggest to use 1, it will adjust frequence automaticlly -->
-    <param name="mapping_skip_frame" type="int" value="1" />
-
-    <!-- remove too closed points -->
-    <param name="minimum_range" type="double" value="0.1"/>
-
-    <param name="mapping_line_resolution" type="double" value="0.4"/>        <!-- A-LOAM -->
-    <param name="mapping_plane_resolution" type="double" value="0.8"/>       <!-- A-LOAM -->
-
-    <param name="mapviz_filter_size" type="double" value="0.1"/> 
-
-    <!-- SC-A-LOAM -->   
-    <param name="keyframe_meter_gap" type="double" value="1.0"/>
-
     <!-- Scan Context -->
-    <param name="sc_dist_thres" type="double" value="0.3"/>                  <!-- SC-A-LOAM, if want no outliers, use 0.1-0.15 -->
+    <param name="sc_distance_threshold" type="double" value="0.3"/>                  <!-- if want no outliers, use 0.1-0.15 -->
     <!-- <param name="sc_max_radius" type="double" value="40.0"/> 20 or 40 for indoor -->
-    <param name="sc_max_radius" type="double" value="80.0"/>                 <!-- for outdoor -->
-    <param name="sc_leaf_size_down" type="double" value="0.4"/>              <!-- for downsampling -->
+    <param name="sc_max_radius" type="double" value="30.0"/>                 <!-- for outdoor -->
+    <param name="sc_voxel_size" type="double" value="0.2"/>              <!-- for downsampling -->
 
+    <!-- PGO-ICP -->   
+   <param name="icp_algorithm" type="string" value="small_gicp"/>            <!-- icp, gicp, ndt, small_gicp, or small_vgicp -->
+    <param name="icp_num_kf_accumulate_past" type="double" value="5"/>            <!-- Number of keyframes point cloud to be included in the submap for icp alignment (old keyframe) -->
+    <param name="icp_num_kf_accumulate_now" type="double" value="2"/>           <!--  Number of keyframes point cloud to be included in the submap for icp alignment (current keyframe) -->
+    <param name="icp_fitness_threshold" type="double" value="0.3"/>     <!-- ICP's loop fitness score threshold to accept closing a loop (i.e. registration was successful) average squared distances between matches -->
+    <param name="icp_voxel_size" type="double" value="0.05"/>             <!-- Downsampling parameters for icp point clouds -->
+    <param name="icp_max_correspondence_distance" type="double" value="2"/>    <!-- Maximum distance before points are ignored -->
+    <param name="icp_save_pointclouds" type="bool" value="false"/>               <!-- Save pointclouds to file (for post-processing) -->
+    <param name="icp_publish_pointclouds" type="bool" value="true"/>          <!-- Publish point clouds (for debugging) -->
+
+    <!-- PGO-GRAPH -->   
+    <param name="graph_kf_gap_lin" type="double" value="2"/> <!-- Euclidean distance between keyframes (m) -->
+    <param name="graph_kf_gap_rot" type="double" value="0.3"/> <!-- Rotational distance between keyframes (rad) -->
+    <param name="graph_lio_noise_lin" type="double" value=".5e-3"/> <!-- Std of noise from LIO (m) -->
+    <param name="graph_lio_noise_rot" type="double" value=".5e-3"/> <!-- Std of noise from LIO (rad) -->
+    <param name="graph_use_gnss" type="bool" value="true"/> <!-- Use GPS or not --> 
+    <param name="graph_use_gnss_altitude" type="bool" value="true"/>   <!-- Use GPS altitude --> 
+    <param name="graph_gnss_min_initialization_distance" type="double" value="10"/>   <!-- Min distance travelled before GNSS will initialize (too small will destabilize map. Should be higher than covariance of GNSS) --> 
+    <param name="graph_gps_noise_threshold" type="double" value="4.0"/> <!-- Covariance threshold for gps measurement to be taken into account (before applying scaling factor) -->
+    <param name="graph_gps_noise_scale" type="double" value="10e0"/> <!-- Scaling factor added to GPS variance. Value will be squared, so 2x value is 2x less certainty -->
+    <param name="graph_gps_noise_z_scale" type="double" value="1e2"/> <!-- Scaling factor added to GPS altitude variance. Value will be squared, so 2x value is 2x less certainty -->
+    <param name="loop_closure_noise_scale" type="double" value="1e-8"/> <!-- Loop Noise scaling factor. Value will be squared -->
+
+    <!-- PGO-LOOP_CLOSURE --> 
+    <param name="loop_closure_use_scancontrol" type="bool" value="true"/> <!-- Use scancontrol -->
+    <param name="loop_closure_use_near_kf" type="bool" value="true"/>               <!-- detect loop closure candidates by distance nearness -->
+
+    <!-- PGO-NEAR_KF --> 
+    <param name="near_kf_distance_threshold" type="double" value="10"/> <!-- Distance that implies a potential match -->
+    <param name="near_kf_min_consecutive_kf_distance" type="double" value="5"/> <!-- Minimum distance between keyframes to be matched for loop closure (from another tested point) -->
+
+    <!-- PGO-VISUALIZE -->   
+    <param name="visualize_voxel_size" type="double" value="0.3"/> 
+
+    <!-- PGO-ROS -->   
+    <param name="ros_gps_topic" type="string" value="/mavros/global_position/global"/>
+    <param name="ros_pointcloud_topic" type="string" value="/cloud_registered_body"/>
+    <param name="ros_odometry_topic" type="string" value="/Odometry"/>
+    <param name="ros_save_directory" type="string" value="/home/ros/save/pointclouds/"/>  <!-- CHANGE THIS and end with / -->
+   
     <param name="lidar_type" type="string" value="MID360"/>
-  
-    <!-- GPS Parameters -->
-    <param name="gps_topic" type="string" value="/mavros/global_position/global"/>
-    <param name="use_gps" type="bool" value="true"/>                   
-    <param name="use_gps_elevation" type="bool" value="true"/>   
-    <param name="gps_dist_thr" type="double" value="5.0"/>                  <!-- Distance between gps measurements to be implemented in the graph-->
-    <param name="gps_cov_thr" type="double" value="4.0"/>                   <!-- Covariance threshold for gps measurement to be taken into account (before applying scaling factor)-->
-    <param name="gps_scale" type="double" value="1.0"/>                     <!-- Scaling factor to be multiplied with gps Covariance -->
-
-    <!-- ICP Parameters (registration when closing loop)-->
-    <param name="icp_num_keyframes_old" type="double" value="10"/>            <!-- Number of keyframes to be kept for the submap of the old keyframe of the loop -->
-    <param name="icp_num_keyframes_curr" type="double" value="2"/>           <!-- Number of keyframes to be kept for the submap of the current keyframe of the loop (a small integer is suggested) -->
-    <param name="icp_loop_fitness_score_thr" type="double" value="0.3"/>     <!-- ICP fitness score to accept a loop closure -->
-    <param name="icp_leaf_size_down" type="double" value="0.2"/>             <!-- Downsampling parameters for icp point clouds -->
-    <param name="loop_noise_score" type="double" value="0.8"/>               <!-- Loop Noise. Lower to increase confidence of registration (currently ICP) -->
-
 
     <!-- input from FASTLIO2 -->
-    <remap from="/aft_mapped_to_init" to="/Odometry"/>
-    <remap from="/velodyne_cloud_registered_local" to="/cloud_registered_body"/>
-    <remap from="/cloud_for_scancontext" to="/cloud_registered"/>          <!-- because ScanContext requires lidar-ego-centric coordinate for the better performance -->
-
-    <!-- utils -->
-    <param name="save_directory" type="string" value="/home/john/SLAM_Spade/src/FAST_LIO_SLAM/SC-PGO/Data/"/>  <!-- CHANGE THIS and end with / -->
+    <remap from="/cloud_for_scancontext" to="/cloud_registered"/>          <!-- because ScanContext requires lidar-ego-centric coordinate for the better performance (cloud registered to map frame topic) -->
 
     <!-- nodes -->
-    <node pkg="spade_pgo" type="laserPGO" name="laserPGO" output="screen" /> <!-- Scan Context-based PGO -->
+    <node pkg="spade_pgo" type="laserPGO" name="laserPGO" output="screen" />
 
     <!-- visulaization -->
     <arg name="rvizscpgo" default="true" />
     <group if="$(arg rvizscpgo)">
-        <node launch-prefix="nice" pkg="rviz" type="rviz" name="rvizscpgo" args="-d $(find spade_pgo)/rviz_cfg/spade_pgo.rviz" />
+        <node launch-prefix="nice" pkg="rviz" type="rviz" name="rvizscpgo" args="-d $(find spade)/rviz_cfg/spade.rviz" />
     </group>
 
 </launch>
