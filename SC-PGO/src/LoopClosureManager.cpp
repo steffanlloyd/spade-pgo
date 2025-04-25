@@ -72,11 +72,13 @@ void LoopClosureManager::submitCandidate(int graph_id1, int graph_id2)
 
 void LoopClosureManager::updateCandidateQueue()
 {
-    static bool flag = false;
-    if(this->kf_indicies_.size() > 2 && !flag){
-        flag = true;
-        this->submitCandidate(this->kf_indicies_.at(0), this->kf_indicies_.at(1));
-    }
+    // Code to use when debugging to insert a loop closure between the first two frames.
+    // This **should** converge, but normally you wouldn't want it there.
+    // static bool flag = false;
+    // if(this->kf_indicies_.size() > 2 && !flag){
+    //     flag = true;
+    //     this->submitCandidate(this->kf_indicies_.at(0), this->kf_indicies_.at(1));
+    // }
 
     if(this->params_->loop_closure.use_near_kf){
         // Get and add near KF candidates
