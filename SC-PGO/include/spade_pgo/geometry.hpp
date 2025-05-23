@@ -26,11 +26,11 @@ double euclideanDistance(const Eigen::Isometry3d& T1, const Eigen::Isometry3d& T
 small_gicp::PointCloud::Ptr pclToEigen(const pcl::PointCloud<PointType>::Ptr& pcl_cloud);
 pcl::PointCloud<pcl::PointXYZ>::Ptr eigenToPcl(const small_gicp::PointCloud::Ptr eigen_cloud);
 pcl::PointCloud<pcl::PointXYZ>::Ptr incrementalVoxelMapToPcl(
-    const std::shared_ptr<small_gicp::IncrementalVoxelMap<small_gicp::FlatContainerNormalCov>>& voxelmap,
+    const std::shared_ptr<small_gicp::IncrementalVoxelMap<small_gicp::FlatContainerCov>>& voxelmap,
     const std::optional<Eigen::Isometry3d> T = std::nullopt);
     
 small_gicp::PointCloud::Ptr getPoints(
-    const std::shared_ptr<small_gicp::IncrementalVoxelMap<small_gicp::FlatContainerNormalCov>>& voxelmap,
+    const std::shared_ptr<small_gicp::IncrementalVoxelMap<small_gicp::FlatContainerCov>>& voxelmap,
     const std::optional<Eigen::Isometry3d>& T = std::nullopt);
 
 } // End namespace geometry

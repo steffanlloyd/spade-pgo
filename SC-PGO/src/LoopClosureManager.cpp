@@ -18,6 +18,7 @@
 #include <small_gicp/factors/gicp_factor.hpp>
 #include <small_gicp/util/normal_estimation_omp.hpp>
 #include <small_gicp/registration/reduction_omp.hpp>
+#include <small_gicp/ann/sequential_voxelmap_accessor.hpp>
 
 #include <ros/ros.h>
 
@@ -72,13 +73,16 @@ void LoopClosureManager::submitCandidate(int graph_id1, int graph_id2)
 
 void LoopClosureManager::updateCandidateQueue()
 {
+    // TO DO: Remove this when not debugging
     // Code to use when debugging to insert a loop closure between the first two frames.
     // This **should** converge, but normally you wouldn't want it there.
-    // static bool flag = false;
-    // if(this->kf_indicies_.size() > 2 && !flag){
-    //     flag = true;
-    //     this->submitCandidate(this->kf_indicies_.at(0), this->kf_indicies_.at(1));
-    // }
+    static bool flag = false;
+
+    if(this->kf_indicies_.size() > 2 && !flag){
+        ROS_WARN("SUBMITTING TEST CANDIDATE BETWEEN 0 and 1: remove this code for disable!");
+        flag = true;
+        this->submitCandidate(this->kf_indicies_.at(0), this->kf_indicies_.at(1));
+    }
 
     if(this->params_->loop_closure.use_near_kf){
         // Get and add near KF candidates
@@ -153,7 +157,7 @@ void LoopClosureManager::submitKeyframeCloud(int kf_index, const Eigen::Isometry
     {
         // Add voxel map to kf_pointclouds and id to kf_indices
         std::lock_guard<std::mutex> lock(this->kf_mutex_);
-        auto new_voxelmap = std::make_shared<small_gicp::IncrementalVoxelMap<small_gicp::FlatContainerNormalCov>>(this->params_->icp.voxel_size);
+        auto new_voxelmap = std::make_shared<small_gicp::IncrementalVoxelMap<small_gicp::FlatContainerCov>>(this->params_->icp.voxel_size);
         new_voxelmap->lru_horizon = 1e9; // Disable LRU removal
         new_voxelmap->lru_clear_cycle = 1e9; // Disable LRU removal
 
@@ -211,21 +215,23 @@ void LoopClosureManager::submitKeyframeCloud(int kf_index, const Eigen::Isometry
  */
 std::optional<std::pair<Eigen::Isometry3d, double>> LoopClosureManager::icp( int lc_id_prev, int lc_id_curr )
 {    
+    // TO DO: Clean up the commented out code. 
     // Get pose corrections from graph
     Eigen::Isometry3d T_corr_prev = this->graph_manager_->getKFCorrection(this->kf_indicies_.at(lc_id_prev));
     Eigen::Isometry3d T_corr_curr = this->graph_manager_->getKFCorrection(this->kf_indicies_.at(lc_id_curr));
 
     // Get point clouds and voxelgrids
-    ros::Time pc_assy_time = ros::Time::now();
+    // ros::Time pc_assy_time = ros::Time::now();
     auto voxelgrid_prev = this->kf_pointclouds_.at(lc_id_prev);
     auto voxelgrid_curr = this->kf_pointclouds_.at(lc_id_curr);
+    const auto voxelgrid_accessor_curr = small_gicp::create_sequential_accessor(*voxelgrid_curr);
 
     // Can remove the pointcloud generation if can just use voxelgrids directly
-    small_gicp::PointCloud::Ptr pointcloud_prev = geometry::getPoints( voxelgrid_prev );
+    // small_gicp::PointCloud::Ptr pointcloud_prev = geometry::getPoints( voxelgrid_prev );
     small_gicp::PointCloud::Ptr pointcloud_curr = geometry::getPoints( voxelgrid_curr );  
     // Only for visualization
-    small_gicp::PointCloud::Ptr pointcloud_curr_viz = geometry::getPoints( voxelgrid_curr, (T_corr_curr.inverse() * T_corr_prev).inverse() );  
-    ROS_INFO("Point cloud assembly took %.3g ms.", (ros::Time::now() - pc_assy_time).toSec()*1e3);
+    // small_gicp::PointCloud::Ptr pointcloud_curr_viz = geometry::getPoints( voxelgrid_curr, (T_corr_curr.inverse() * T_corr_prev).inverse() );  
+    // ROS_INFO("Point cloud assembly took %.3g ms.", (ros::Time::now() - pc_assy_time).toSec()*1e3);
     
     if(voxelgrid_curr->size() < 100 || voxelgrid_prev->size() < 100) {
         ROS_WARN("[Loop Closure] Point cloud size too small (%zu and %zu). Not adding loop closure between %d and %d.", voxelgrid_curr->size(), voxelgrid_prev->size(), lc_id_prev, lc_id_curr);
@@ -233,14 +239,16 @@ std::optional<std::pair<Eigen::Isometry3d, double>> LoopClosureManager::icp( int
     }
 
     // Estimate covariances
-    ros::Time estimate_cov_time = ros::Time::now();
+    // ros::Time estimate_cov_time = ros::Time::now();
+    // TO DO: Remove/clean up this
     small_gicp::estimate_covariances_omp(*pointcloud_curr, 10, 6);
     // small_gicp::estimate_covariances_omp(*pointcloud_prev, 10, 6);
-    ROS_INFO("Covariance estimation took %.3g ms.", (ros::Time::now() - estimate_cov_time).toSec()*1e3);
+    // ROS_INFO("Covariance estimation took %.3g ms.", (ros::Time::now() - estimate_cov_time).toSec()*1e3);
 
     // Publish clouds, if in settings
-    ROS_INFO("Publishing loop closure clouds.");
-    this->visualizer_->publishLCClouds(pointcloud_curr_viz, pointcloud_prev);
+    // TO DO: Re-enable this, but only when the parameters ask for it
+    // ROS_INFO("Publishing loop closure clouds.");
+    // this->visualizer_->publishLCClouds(pointcloud_curr_viz, pointcloud_prev);
     
     // Set up ICP settings
     ROS_INFO("Setting up registration.");
@@ -250,40 +258,46 @@ std::optional<std::pair<Eigen::Isometry3d, double>> LoopClosureManager::icp( int
     registration.criteria.rotation_eps = 0.1 * M_PI / 180.0;
     registration.criteria.translation_eps = 1e-3;
     registration.optimizer.max_iterations = 15;
-    registration.optimizer.verbose = false;
+    registration.optimizer.verbose = true;
 
-    // I'm unsure if this should be inverse or not
-    Isometry3d init_transform = (T_corr_curr.inverse() * T_corr_prev).inverse();
+    // This has been checked to be the correct transform (it's not the inverse of this)
+    Isometry3d init_transform = T_corr_curr.inverse() * T_corr_prev;
 
     ROS_INFO("Running ICP.");
     ros::Time icp_start_time = ros::Time::now();
-    auto result = registration.align(*voxelgrid_prev, *pointcloud_curr, *voxelgrid_prev, init_transform);
+
+    // TO DO: make this work
+    auto result = registration.align(*voxelgrid_prev, voxelgrid_accessor_curr, *voxelgrid_prev, init_transform); // voxelgrid accessor
+    // auto result = registration.align(*voxelgrid_prev, *pointcloud_curr, *voxelgrid_prev, init_transform); // this one works
     // auto result = registration.align(*pointcloud_prev, *pointcloud_curr, init_transform);
 
     float fitness_score = result.error / result.num_inliers;
     Isometry3d correction_transform = result.T_target_source;
     ROS_INFO("ICP took %.3g ms. Fitness score: %.4g, converged: %d. Took %ld iterations. Num inliers: %ld", (ros::Time::now() - icp_start_time).toSec()*1e3, fitness_score, result.converged, result.iterations, result.num_inliers);
 
+    // TO DO: Re-enable this
     // If fitness score is low but result didn't converge, search further
-    if (fitness_score < this->params_->icp.fitness_threshold*5 && !result.converged)
-    {
-        registration.optimizer.max_iterations = 35;
-        ROS_INFO("[Loop Closure] ICP had low fitness but didn't converge. Trying again with more iterations.");
-        ros::Time icp_start_time2 = ros::Time::now();
-        result = registration.align(*voxelgrid_prev, *pointcloud_curr, *voxelgrid_prev, result.T_target_source);
-        ROS_INFO("Second ICP took %.3g ms. Fitness score: %.4g, converged: %d. Took %ld iterations.", (ros::Time::now() - icp_start_time2).toSec()*1e3, fitness_score, result.converged, result.iterations);
+    // if (fitness_score < this->params_->icp.fitness_threshold*5 && !result.converged)
+    // {
+    //     registration.optimizer.max_iterations = 35;
+    //     ROS_INFO("[Loop Closure] ICP had low fitness but didn't converge. Trying again with more iterations.");
+    //     ros::Time icp_start_time2 = ros::Time::now();
+    //     result = registration.align(*voxelgrid_prev, voxelgrid_accessor_curr, *voxelgrid_prev, result.T_target_source);
+    //     ROS_INFO("Second ICP took %.3g ms. Fitness score: %.4g, converged: %d. Took %ld iterations.", (ros::Time::now() - icp_start_time2).toSec()*1e3, fitness_score, result.converged, result.iterations);
 
-        // Update fitness score and transform
-        fitness_score = result.error / result.num_inliers;
-        correction_transform = result.T_target_source;
-    }
+    //     // Update fitness score and transform
+    //     fitness_score = result.error / result.num_inliers;
+    //     correction_transform = result.T_target_source;
+    // }
 
+    // Error out if didn't converge
     if (!result.converged || std::isnan(fitness_score) || fitness_score > this->params_->icp.fitness_threshold) {
         ROS_WARN("[Loop Closure] ICP fitness test failed (%.4g > %.4g). Not adding loop closure between %d and %d. ICP runtime: %.3g ms. Distance: %.4g m.", fitness_score, this->params_->icp.fitness_threshold, lc_id_prev, lc_id_curr, (ros::Time::now() - icp_start_time).toSec()*1e3, correction_transform.translation().norm());
         return std::nullopt;
-    } else {
-        ROS_INFO("[Loop Closure] ICP fitness test passed (%.4g < %.4g). Adding loop closure between %d and %d. ICP runtime: %.3g ms. Distance: %.4g m.", fitness_score, this->params_->icp.fitness_threshold, lc_id_prev, lc_id_curr, (ros::Time::now() - icp_start_time).toSec()*1e3, correction_transform.translation().norm());
     }
+
+    // Converged well, return answer and echo
+    ROS_INFO("[Loop Closure] ICP fitness test passed (%.4g < %.4g). Adding loop closure between %d and %d. ICP runtime: %.3g ms. Distance: %.4g m.", fitness_score, this->params_->icp.fitness_threshold, lc_id_prev, lc_id_curr, (ros::Time::now() - icp_start_time).toSec()*1e3, correction_transform.translation().norm());
 
     return std::make_pair(correction_transform, fitness_score);
 

@@ -130,7 +130,7 @@ pcl::PointCloud<pcl::PointXYZ>::Ptr spade_pgo::geometry::eigenToPcl(const small_
  * @return The converted pcl point cloud.
  */
 pcl::PointCloud<pcl::PointXYZ>::Ptr spade_pgo::geometry::incrementalVoxelMapToPcl(
-    const std::shared_ptr<small_gicp::IncrementalVoxelMap<small_gicp::FlatContainerNormalCov>>& voxelmap,
+    const std::shared_ptr<small_gicp::IncrementalVoxelMap<small_gicp::FlatContainerCov>>& voxelmap,
     const std::optional<Eigen::Isometry3d> T)
 {
     std::vector<Eigen::Vector4d> eigen_points = small_gicp::traits::voxel_points(*voxelmap);
@@ -168,7 +168,7 @@ pcl::PointCloud<pcl::PointXYZ>::Ptr spade_pgo::geometry::incrementalVoxelMapToPc
  * @return The points in the voxelmap.
  */
 small_gicp::PointCloud::Ptr spade_pgo::geometry::getPoints(
-    const std::shared_ptr<small_gicp::IncrementalVoxelMap<small_gicp::FlatContainerNormalCov>>& voxelmap,
+    const std::shared_ptr<small_gicp::IncrementalVoxelMap<small_gicp::FlatContainerCov>>& voxelmap,
     const std::optional<Eigen::Isometry3d>& T)
 {
     auto points = std::make_shared<small_gicp::PointCloud>(small_gicp::traits::voxel_points(*voxelmap));
@@ -178,6 +178,7 @@ small_gicp::PointCloud::Ptr spade_pgo::geometry::getPoints(
         }
     }
 
+    // TO DO: Clean this up
     // points->points.reserve(voxelmap->size() * 5);
     // points->normals.reserve(voxelmap->size() * 5);
     // points->covs.reserve(voxelmap->size() * 5);

@@ -54,7 +54,7 @@ private:
     std::shared_ptr<PGOParams> params_;
 
     std::vector<int> kf_indicies_;
-    std::vector<std::shared_ptr<small_gicp::IncrementalVoxelMap<small_gicp::FlatContainerNormalCov>>> kf_pointclouds_;
+    std::vector<std::shared_ptr<small_gicp::IncrementalVoxelMap<small_gicp::FlatContainerCov>>> kf_pointclouds_;
 
     std::queue<std::pair<int, int>> candidate_queue_;
     std::vector<std::pair<int, int>> tested_candidates_;
