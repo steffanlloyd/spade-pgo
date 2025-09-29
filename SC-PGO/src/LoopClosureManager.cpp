@@ -16,6 +16,7 @@
 #include <small_gicp/points/point_cloud.hpp>
 #include <small_gicp/ann/incremental_voxelmap.hpp>
 #include <small_gicp/factors/gicp_factor.hpp>
+#include <small_gicp/factors/icp_factor.hpp>
 #include <small_gicp/util/normal_estimation_omp.hpp>
 #include <small_gicp/registration/reduction_omp.hpp>
 #include <small_gicp/ann/sequential_voxelmap_accessor.hpp>
@@ -241,7 +242,8 @@ std::optional<std::pair<Eigen::Isometry3d, double>> LoopClosureManager::icp( int
     // Estimate covariances
     // ros::Time estimate_cov_time = ros::Time::now();
     // TO DO: Remove/clean up this
-    small_gicp::estimate_covariances_omp(*pointcloud_curr, 10, 6);
+    small_gicp::estimate_covariances_omp(*voxelgrid_curr, 10, 6);
+    // small_gicp::estimate_covariances_omp(*pointcloud_curr, 10, 6);
     // small_gicp::estimate_covariances_omp(*pointcloud_prev, 10, 6);
     // ROS_INFO("Covariance estimation took %.3g ms.", (ros::Time::now() - estimate_cov_time).toSec()*1e3);
 
