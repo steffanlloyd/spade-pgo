@@ -9,6 +9,7 @@ from pypcd import pypcd
 import numpy as np
 from numpy import linalg as LA
 import open3d as o3d
+import re
 
 import laspy  # Import the laspy library to handle LAS format
 
@@ -24,7 +25,6 @@ parser = argparse.ArgumentParser()
 parser.add_argument("-i", "--input", help="Input directory", required=True)
 args = parser.parse_args()
 
-
 ##########################
 # User only consider this block
 ##########################
@@ -35,10 +35,10 @@ if not data_dir.endswith('/'):
 
 node_skip = 1
 
-num_points_in_a_scan = 13000  # for reservation (save faster) // e.g., use 150000 for 128 ray lidars, 100000 for 64 ray lidars, 30000 for 16 ray lidars, if error occured, use the larger value.
+num_points_in_a_scan = 100000  # for reservation (save faster) // e.g., use 150000 for 128 ray lidars, 100000 for 64 ray lidars, 30000 for 16 ray lidars, if error occured, use the larger value.
 
 is_live_vis = False  # recommend to use false 
-is_o3d_vis = True
+is_o3d_vis = False
 intensity_color_max = 200
 
 is_near_removal = True
@@ -46,13 +46,16 @@ thres_near_removal = 2  # meter (to remove platform-myself structure ghost point
 
 ##########################
 
-scan_dir = data_dir + "Scans"
+scan_dir = os.path.join(data_dir, "scans")
 scan_files = os.listdir(scan_dir) 
+scan_files = [f for f in os.listdir(scan_dir) if f.lower().endswith(".pcd")]
 scan_files.sort()
-scan_idx_range_to_stack = [0, len(scan_files)]
+scan_idx_range_to_stack = [0, len(scan_files)-1]
 
 poses = []
 f = open(data_dir + "optimized_poses.txt", 'r')
+offset_x = 0
+offset_y = 0
 while True:
     line = f.readline()
     if not line: break
@@ -68,10 +71,8 @@ while True:
     poses.append(pose_SE3)
 f.close()
 
-
 assert (scan_idx_range_to_stack[1] > scan_idx_range_to_stack[0])
 print("Merging scans from", scan_idx_range_to_stack[0], "to", scan_idx_range_to_stack[1])
-
 
 if(is_live_vis):
     vis = o3d.visualization.Visualizer() 
@@ -97,11 +98,29 @@ for node_idx in range(len(scan_files)):
         if(node_idx != scan_idx_range_to_stack[0]): # to ensure the vis init 
             continue
 
-    print("read keyframe scan idx", node_idx)
-
     scan_pose = poses[node_idx]
 
-    scan_path = os.path.join(scan_dir, scan_files[node_idx])
+    scan_path = os.path.join(scan_dir, f"{node_idx+1:06d}.pcd") # scan names use 1-based index
+    if not os.path.exists(scan_path):
+        print(f"Warning: cannot find scan file for index {node_idx} in PCD format. Skipping frame.")
+        continue
+    
+    print(f"Reading keyframe scan index {node_idx} from {scan_path}. Current point count: {curr_count}.")
+
+    # Sanity checks
+    # Check rotation validity and det ~ +1 (proper rotation)
+    R = scan_pose[:3,:3]
+    if not np.allclose(R @ R.T, np.eye(3), atol=1e-3):
+        print(f"Warning! R is not orthonormal, det(R0)={np.linalg.det(R)}")
+
+    # Check that sequential pose jumps are reasonable (not meters->kilometers)
+    if node_idx > 1:
+        tim1 = poses[node_idx-1][:3,3]; ti = poses[node_idx][:3,3]
+        dist = np.linalg.norm(ti - tim1)
+        if dist > 10.0:  # 10 meters
+            print(f"Warning: sequential pose motion is very large (m): {dist}")
+
+    # scan_path = os.path.join(scan_dir, scan_files[node_idx])
     scan_pcd = o3d.io.read_point_cloud(scan_path)
     scan_xyz_local = copy.deepcopy(np.asarray(scan_pcd.points))
 
@@ -140,7 +159,6 @@ for node_idx in range(len(scan_files)):
     np_intensity_all[curr_count:curr_count + scan_xyz.shape[0], :] = scan_intensity
 
     curr_count += scan_xyz.shape[0]
-    print(curr_count)
 
 
 if(is_o3d_vis):
