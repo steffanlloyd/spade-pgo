@@ -234,6 +234,9 @@ log/
 *.pcd
 *.las
 *.zip
+*.tif
+*.tiff
+**/data
 
 # Emacs
 .#*
