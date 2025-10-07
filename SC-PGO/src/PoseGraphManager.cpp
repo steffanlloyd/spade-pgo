@@ -369,7 +369,7 @@ void PoseGraphManager::addGNSSFactor(int kf_index, nav_msgs::Odometry::ConstPtr 
     gnss_noise(2) *= (this->params->graph.gps_noise_z_scale*this->params->graph.gps_noise_z_scale); // Further scale the z-factor by the scaling factor squared.
 
     // Adjust noise on z-vector if not using GPS altitude
-    if( this->params->graph.use_gnss_altitude ) gnss_noise(2) = 1e10; // OR 1e10
+    if( !this->params->graph.use_gnss_altitude ) gnss_noise(2) = 1e10; // OR 1e10
 
     // At first iteration, artificially reduce the gps noise to lock the map in place.
     // if(!this->gnss_initialized_ && this->gnss_factor_buffer_.size() == 0){

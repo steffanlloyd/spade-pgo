@@ -78,6 +78,7 @@ void LoopClosureManager::updateCandidateQueue()
 
 void LoopClosureManager::processCandidateQueue()
 {
+    bool queue_not_empty = !this->candidate_queue_.empty();
     while ( !this->candidate_queue_.empty() )
     {
         if( this->candidate_queue_.size() > 200 ) {
@@ -112,7 +113,12 @@ void LoopClosureManager::processCandidateQueue()
 
             // Add to list of added loop closures
             this->added_loop_closures_.emplace_back(kf_prev, kf_curr);
+
+            ROS_INFO_THROTTLE(5, "Loop closure queue size: %ld", this->candidate_queue_.size());
         } 
+    }
+    if (queue_not_empty && this->candidate_queue_.empty()) {
+        ROS_INFO("Finished processing loop closure candidates");
     }
 }
 
