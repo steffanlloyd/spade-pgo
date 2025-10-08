@@ -6,9 +6,9 @@
   <!-- ========== FAST-LIO (mapping) ========== -->
   <!-- Load FAST-LIO params into the node's private namespace -->
   <rosparam command="load"
-            file="$(find spade)/config/fastlio_mid360.yaml"
+            file="$(find spade_pgo)/config/fastlio_mid360.yaml"
             ns="laserMapping"/>
-  <rosparam command="load" file="$(find fast_lio)/config/mid360.yaml" />
+  <rosparam command="load" file="$(find spade_pgo)/config/mid360.yaml" />
 
   <!-- FAST-LIO mapping node -->
   <node pkg="fast_lio" type="fastlio_mapping" name="laserMapping" output="screen" />
@@ -23,7 +23,7 @@
   <!-- ========== PGO (Scan Context + ICP + Pose Graph) ========== -->
   <!-- Load PGO params into the node's private namespace -->
   <rosparam command="load"
-            file="$(find spade)/config/pgo.yaml" />
+            file="$(find spade_pgo)/config/pgo.yaml" />
 
   <!-- PGO node -->
   <node pkg="spade_pgo" type="spade_pgo_node" name="spade_pgo_node" output="screen">
