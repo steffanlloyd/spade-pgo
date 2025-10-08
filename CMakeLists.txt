@@ -37,8 +37,8 @@ include_directories(
   /usr/include/GeographicLib
 )
 
-add_executable(laserPGO 
-  src/laserPosegraphOptimization_new.cpp
+add_executable(spade_pgo_node 
+  src/spade_pgo_node.cpp
   src/DataBuffer.cpp
   src/geometry.cpp
   src/LoopClosureManager.cpp
@@ -49,10 +49,10 @@ add_executable(laserPGO
   src/Visualizer.cpp
   include/scancontext/Scancontext.cpp
 )
-target_compile_options(laserPGO 
+target_compile_options(spade_pgo_node 
   PRIVATE ${OpenMP_CXX_FLAGS}
 )
-target_link_libraries(laserPGO 
+target_link_libraries(spade_pgo_node 
   ${catkin_LIBRARIES} ${PCL_LIBRARIES}
   ${OpenMP_CXX_FLAGS}
   gtsam

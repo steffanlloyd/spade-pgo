@@ -132,58 +132,56 @@ int main(int argc, char **argv)
 
     auto params = std::make_shared<PGOParams>();
 
-    // ScanControl parameters
-    nh.param<double>("sc_distance_threshold", params->sc.distance_threshold, 0.2);  
-	nh.param<double>("sc_max_radius",  params->sc.max_radius, 25.0); // 80 is recommended for outdoor, and lower (ex, 20, 40) values are recommended for indoor 
-    nh.param<double>("sc_voxel_size", params->sc.voxel_size, 0.4); // Scan Context point cloud downsampling
-
     //ICP Params
-    nh.param<std::string>("icp_algorithm", params->icp.algorithm, "small_gicp"); // icp, gicp, ndt, small_gicp, or small_vgicp
-    nh.param<int>("icp_num_kf_accumulate_past", params->icp.num_kf_accumulate_past, 5); // Number of keyframes point cloud to be included in the submap for icp alignment (old keyframe)
-    nh.param<int>("icp_num_kf_accumulate_now", params->icp.num_kf_accumulate_now, 2); // Number of keyframes point cloud to be included in the submap for icp alignment (current keyframe)
-    nh.param<double>("icp_fitness_threshold", params->icp.fitness_threshold, 0.3); // ICP's loop fitness score threshold to accept closing a loop (i.e. registration was successful)
+    nh.param<std::string>("spade_pgo/icp/algorithm", params->icp.algorithm, "small_gicp"); // icp, gicp, ndt, small_gicp, or small_vgicp
+    nh.param<int>("spade_pgo/icp/num_kf_accumulate_past", params->icp.num_kf_accumulate_past, 5); // Number of keyframes point cloud to be included in the submap for icp alignment (old keyframe)
+    nh.param<int>("spade_pgo/icp/num_kf_accumulate_now", params->icp.num_kf_accumulate_now, 2); // Number of keyframes point cloud to be included in the submap for icp alignment (current keyframe)
+    nh.param<double>("spade_pgo/icp/fitness_threshold", params->icp.fitness_threshold, 0.3); // ICP's loop fitness score threshold to accept closing a loop (i.e. registration was successful)
     // average squared distances between matches
-    nh.param<double>("icp_voxel_size", params->icp.voxel_size, 0.2); // ICP's downsampling   
-    nh.param<double>("icp_max_correspondence_distance", params->icp.max_correspondence_distance, 2); // Maximum distance before points are ignored
-    nh.param<bool>("icp_save_pointclouds", params->icp.save_pointclouds, false); // Save pointclouds to file (for post-processing)
-    nh.param<bool>("icp_publish_pointclouds", params->icp.publish_pointclouds, false); // Publish point clouds (for debugging)
+    nh.param<double>("spade_pgo/icp/voxel_size", params->icp.voxel_size, 0.2); // ICP's downsampling   
+    nh.param<double>("spade_pgo/icp/max_correspondence_distance", params->icp.max_correspondence_distance, 2); // Maximum distance before points are ignored
+    nh.param<bool>("spade_pgo/icp/save_pointclouds", params->icp.save_pointclouds, false); // Save pointclouds to file (for post-processing)
+    nh.param<bool>("spade_pgo/icp/publish_pointclouds", params->icp.publish_pointclouds, false); // Publish point clouds (for debugging)
 
     // Graph parameters
-	nh.param<double>("graph_kf_gap_lin", params->graph.kf_gap_lin, 1.0); // Euclidean distance between keyframes (m)
-	nh.param<double>("graph_kf_gap_rot", params->graph.kf_gap_rot, 0.2); // Rotational distance between keyframes (rad)
-    nh.param<double>("graph_lio_noise_lin", params->graph.lio_noise_lin, 1e-3); // Std of noise from LIO (m)
-    nh.param<double>("graph_lio_noise_rot", params->graph.lio_noise_rot, 1e-2); // Std of noise from LIO (rad)
-    nh.param<double>("graph_prior_noise_lin", params->graph.prior_noise_lin, 5); // Prior noise from gps/imu initial pose estimate (m)
-    nh.param<double>("graph_prior_noise_rot", params->graph.prior_noise_rot, 0.2); // Prior noise from gps/imu initial pose estimate (rad)
-    nh.param<bool>("graph_use_gnss", params->graph.use_gnss, true); // Use GPS or not
-    nh.param<bool>("graph_use_gnss_altitude", params->graph.use_gnss_altitude, true); // Use GPS altitude
-    nh.param<double>("graph_gps_noise_threshold", params->graph.gps_noise_threshold, 4.0); // Covariance threshold for gps measurement to be taken into account (before applying scaling factor)
-    nh.param<double>("graph_gps_noise_scale", params->graph.gps_noise_scale, 1.0); // Scaling factor added to GPS variance. Value will be squared, so 2x value is 2x less certainty
-    nh.param<double>("graph_gps_noise_z_scale", params->graph.gps_noise_z_scale, 1e2); // Scaling factor added to GPS altitude variance. Value will be squared, so 2x value is 2x less certainty
-    nh.param<double>("graph_gnss_min_initialization_distance", params->graph.gnss_min_initialization_distance, 5); // Min distance travelled before GNSS will initialize (too small will destabilize map. Should be higher than covariance of GNSS)
-    nh.param<double>("graph_loop_closure_noise_scale", params->graph.loop_closure_noise_scale, 1); // Loop Noise scaling factor. Value will be squared
-    nh.param<int>("graph_orientation_calibration_size", params->graph.orientation_calibration_size, 20); // Number of samples from the imu and heading to calculate the initial pose
-    nh.param<bool>("graph_use_orientation_calibration", params->graph.use_orientation_calibration, true); // Whether or not to use the orientation calibration procedue. If yes, must specify an IMU and heading stream.
+	nh.param<double>("spade_pgo/graph/kf_gap_lin", params->graph.kf_gap_lin, 1.0); // Euclidean distance between keyframes (m)
+	nh.param<double>("spade_pgo/graph/kf_gap_rot", params->graph.kf_gap_rot, 0.2); // Rotational distance between keyframes (rad)
+    nh.param<double>("spade_pgo/graph/lio_noise_lin", params->graph.lio_noise_lin, 1e-3); // Std of noise from LIO (m)
+    nh.param<double>("spade_pgo/graph/lio_noise_rot", params->graph.lio_noise_rot, 1e-2); // Std of noise from LIO (rad)
+    nh.param<double>("spade_pgo/graph/prior_noise_lin", params->graph.prior_noise_lin, 5); // Prior noise from gps/imu initial pose estimate (m)
+    nh.param<double>("spade_pgo/graph/prior_noise_rot", params->graph.prior_noise_rot, 0.2); // Prior noise from gps/imu initial pose estimate (rad)
+    nh.param<bool>("spade_pgo/graph/use_gnss", params->graph.use_gnss, true); // Use GPS or not
+    nh.param<bool>("spade_pgo/graph/use_gnss_altitude", params->graph.use_gnss_altitude, true); // Use GPS altitude
+    nh.param<double>("spade_pgo/graph/gps_noise_threshold", params->graph.gps_noise_threshold, 4.0); // Covariance threshold for gps measurement to be taken into account (before applying scaling factor)
+    nh.param<double>("spade_pgo/graph/gps_noise_scale", params->graph.gps_noise_scale, 1.0); // Scaling factor added to GPS variance. Value will be squared, so 2x value is 2x less certainty
+    nh.param<double>("spade_pgo/graph/gps_noise_z_scale", params->graph.gps_noise_z_scale, 1e2); // Scaling factor added to GPS altitude variance. Value will be squared, so 2x value is 2x less certainty
+    nh.param<double>("spade_pgo/graph/gnss_min_initialization_distance", params->graph.gnss_min_initialization_distance, 5); // Min distance travelled before GNSS will initialize (too small will destabilize map. Should be higher than covariance of GNSS)
+    nh.param<double>("spade_pgo/graph/loop_closure_noise_scale", params->graph.loop_closure_noise_scale, 1); // Loop Noise scaling factor. Value will be squared
+    nh.param<int>("spade_pgo/graph/orientation_calibration_size", params->graph.orientation_calibration_size, 20); // Number of samples from the imu and heading to calculate the initial pose
+    nh.param<bool>("spade_pgo/graph/use_orientation_calibration", params->graph.use_orientation_calibration, true); // Whether or not to use the orientation calibration procedue. If yes, must specify an IMU and heading stream.
 
-    // Loop closure params
-    nh.param<bool>("loop_closure_use_scancontrol", params->loop_closure.use_scancontrol, false);
-    nh.param<bool>("loop_closure_use_near_kf", params->loop_closure.use_near_kf, false);
-
+    // ScanControl parameters
+    nh.param<bool>("spade_pgo/sc/enabled", params->sc.enabled, false);
+    nh.param<double>("spade_pgo/sc/distance_threshold", params->sc.distance_threshold, 0.2);  
+	nh.param<double>("spade_pgo/sc/max_radius",  params->sc.max_radius, 25.0); // 80 is recommended for outdoor, and lower (ex, 20, 40) values are recommended for indoor 
+    nh.param<double>("spade_pgo/sc/voxel_size", params->sc.voxel_size, 0.4); // Scan Context point cloud downsampling
+    
     // Near KF loop closure commands
-    nh.param<double>("near_kf_distance_threshold", params->near_kf.distance_threshold, 10); // Distance that implies a potential match
-    nh.param<double>("near_kf_min_consecutive_kf_distance", params->near_kf.min_consecutive_kf_distance, 5); // Minimum distance between keyframes to be matched for loop closure (from another tested point)
-    nh.param<int>("near_kf_min_kf_seperation", params->near_kf.min_kf_seperation, 30); // Minimum number of keyframes between the two keyframes to be matched for loop closure (from another tested point)
+    nh.param<bool>("spade_pgo/near_kf/enabled", params->near_kf.enabled, false);
+    nh.param<double>("spade_pgo/near_kf/distance_threshold", params->near_kf.distance_threshold, 10); // Distance that implies a potential match
+    nh.param<double>("spade_pgo/near_kf/min_consecutive_kf_distance", params->near_kf.min_consecutive_kf_distance, 5); // Minimum distance between keyframes to be matched for loop closure (from another tested point)
+    nh.param<int>("spade_pgo/near_kf/min_kf_seperation", params->near_kf.min_kf_seperation, 30); // Minimum number of keyframes between the two keyframes to be matched for loop closure (from another tested point)
 
     // Visualization parameters
-	nh.param<double>("visualize_voxel_size", params->visualize.voxel_size, 0.4); // pose assignment every k frames 
+	nh.param<double>("spade_pgo/visualize/voxel_size", params->visualize.voxel_size, 0.4); // pose assignment every k frames 
 
     // ROS parameters
-    nh.param<std::string>("ros_gps_topic", params->ros.gps_topic, "/mavros/global_position/global");
-	nh.param<std::string>("ros_pointcloud_topic", params->ros.pointcloud_topic, "/cloud_registered_body"); // Should be local frame (registered to the sensor body)
-	nh.param<std::string>("ros_odometry_topic", params->ros.odometry_topic, "/Odometry");
-    nh.param<std::string>("ros_imu_topic", params->ros.imu_topic, "/mavros/imu/data");
-    nh.param<std::string>("ros_heading_topic", params->ros.heading_topic, "/mavros/global_position/compass_hdg");
-    nh.param<std::string>("ros_save_directory", params->ros.save_directory, "/");
+    nh.param<std::string>("spade_pgo/ros/gps_topic", params->ros.gps_topic, "/mavros/global_position/global");
+	nh.param<std::string>("spade_pgo/ros/pointcloud_topic", params->ros.pointcloud_topic, "/cloud_registered_body"); // Should be local frame (registered to the sensor body)
+	nh.param<std::string>("spade_pgo/ros/odometry_topic", params->ros.odometry_topic, "/Odometry");
+    nh.param<std::string>("spade_pgo/ros/imu_topic", params->ros.imu_topic, "/mavros/imu/data");
+    nh.param<std::string>("spade_pgo/ros/heading_topic", params->ros.heading_topic, "/mavros/global_position/compass_hdg");
+    nh.param<std::string>("spade_pgo/ros/save_directory", params->ros.save_directory, "/home/ros/save/pointclouds/");
 
     int ret1 = system((std::string("exec rm -r ") + params->ros.save_directory).c_str());
     int ret2 = system((std::string("mkdir -p ") + params->ros.save_directory).c_str());

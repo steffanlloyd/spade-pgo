@@ -52,26 +52,27 @@ void LoopClosureManager::submitCandidate(int id1, int id2)
     }
     // Add to list of tested candidates
     this->tested_candidates_.emplace_back(id1, id2);
-    ROS_INFO("Added loop closure candidate between %d and %d", id1, id2);
 }
 
 void LoopClosureManager::updateCandidateQueue()
 {
-    if(this->params_->loop_closure.use_near_kf){
+    if(this->params_->near_kf.enabled){
         // Get and add near KF candidates
         auto candidates_near_kf = this->near_kf_detector.getNearKFCandidates(this->graph_manager_->getUpdatedKFPoses());
 
         for (const auto& candidate : candidates_near_kf){
+            ROS_INFO("Added near_kf loop closure candidate between %d and %d", candidate.first, candidate.second);
             this->submitCandidate(candidate.first, candidate.second);
         }
     }
 
     // Only do SC if we have enough keyframes (and enabled)
-    if( this->params_->loop_closure.use_scancontrol &&
+    if( this->params_->sc.enabled &&
         this->graph_manager_->graphSize() > this->sc_detector.NUM_EXCLUDE_RECENT)
     {
         auto sc_candidate = this->sc_detector.detectLoopClosureID();
         if (sc_candidate.first != -1)
+            ROS_INFO("Added SC loop closure candidate between %d and %d", sc_candidate.first, this->graph_manager_->currentKFIndex());
             this->submitCandidate(sc_candidate.first, this->graph_manager_->currentKFIndex());
     }
 }
@@ -113,9 +114,10 @@ void LoopClosureManager::processCandidateQueue()
 
             // Add to list of added loop closures
             this->added_loop_closures_.emplace_back(kf_prev, kf_curr);
-
-            ROS_INFO_THROTTLE(5, "Loop closure queue size: %ld", this->candidate_queue_.size());
         } 
+
+        ROS_INFO("Loop closure queue size: %ld", this->candidate_queue_.size());
+
     }
     if (queue_not_empty && this->candidate_queue_.empty()) {
         ROS_INFO("Finished processing loop closure candidates");

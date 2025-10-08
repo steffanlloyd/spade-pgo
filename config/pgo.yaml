@@ -1,0 +1,64 @@
+# SPADE PGO (ICP + Pose Graph) — node private namespace: /laserPGO
+# All parameters include comments describing their effect. Values below mirror your previous launch.
+
+spade_pgo:
+  # --------------------------- ROS I/O --------------------------------------------------------
+  ros:
+    gps_topic: "/mavros/global_position/globalx"  # (string) GNSS NavSatFix topic
+    imu_topic: "/livox/imu"                  # (string) IMU topic (used for timing/orientation if enabled)
+    pointcloud_topic: "/cloud_registered_body"  # (string) LiDAR cloud in the *body* frame (ego-centric) for SC/ICP
+    odometry_topic: "/Odometry"              # (string) Odometry topic from FAST-LIO
+    heading_topic: ""                        # (string, optional) Compass heading topic; leave empty if unused
+    save_directory: "/home/ros/save/pointclouds/"  # (string, path) Directory to dump PCDs, logs, etc. (end with '/')
+
+  # --------------------------- Scan Context (loop candidate search) ---------------------------
+  sc:
+    enabled: true            # (bool) Enable ScanContext-based loop closure detection
+    distance_threshold: 0.3   # (double) Cosine distance threshold for ScanContext similarity; lower = stricter matching (0.1–0.15 very strict)
+    max_radius: 30.0          # (double, meters) Max radius of the SC "ring keys". Outdoor often larger (30–80), indoor smaller (20–40)
+    voxel_size: 0.2           # (double, meters) Downsampling leaf size for building ScanContext descriptors (speed vs. fidelity)
+
+  # --------------------------- ICP (registration of loop candidates / submaps) ----------------
+  icp:
+    algorithm: "small_gicp"  # (string) One of: icp, gicp, ndt, small_gicp, small_vgicp
+    num_kf_accumulate_past: 5    # (int) How many past keyframes to fuse into the "old" submap during alignment
+    num_kf_accumulate_now: 2     # (int) How many recent keyframes to fuse into the "current" submap
+    fitness_threshold: 0.3       # (double) Accept loop if ICP mean squared error < this threshold (smaller = stricter)
+    voxel_size: 0.05             # (double, meters) Voxel size used to downsample point clouds before ICP (speed/robustness)
+    max_correspondence_distance: 2.0  # (double, meters) Ignore point pairs farther than this during ICP
+    save_pointclouds: false      # (bool) If true, write ICP submaps/PCDs to disk for offline analysis
+    publish_pointclouds: true    # (bool) If true, publish ICP submaps/PCDs for debugging/visualization
+
+  # --------------------------- Pose Graph (node/edge creation & uncertainties) ----------------
+  graph:
+    kf_gap_lin: 1.0         # (double, meters) Linear travel between keyframes before creating a new node
+    kf_gap_rot: 0.3         # (double, rad)    Rotational change before creating a new node
+    lio_noise_lin: 5.0e-4   # (double, m)      Std dev for LIO linear noise used in edges
+    lio_noise_rot: 5.0e-4   # (double, rad)    Std dev for LIO rotational noise used in edges
+    prior_noise_lin: 5.0    # (double, m)      Prior noise on initial guess edges (e.g., GNSS/IMU seed)
+    prior_noise_rot: 3.0    # (double, rad)    Prior noise on initial orientation guess. Large if unknown (if not using IMU initialization).
+    use_gnss: true          # (bool)  Fuse GNSS measurements as absolute pose factors
+    use_gnss_altitude: true # (bool)  Fuse GNSS altitude (Z). Disable if your Z is handled elsewhere
+    gnss_min_initialization_distance: 15.0  # (double, m) Distance to travel before enabling GNSS fusion (avoid early-map instability)
+    gps_noise_threshold: 20  # (double) Max covariance allowed for accepting a GNSS fix (pre-scale). Set to large number to disable filtering.
+    gps_noise_scale: 5.0         # (double) Variance scaling for GNSS XY; effective variance = (scale)^2 * covariance
+    gps_noise_z_scale: 1.0e2       # (double) Variance scaling for GNSS Z (altitude); squared internally as well
+    loop_closure_noise_scale: 1.0e-2   # (double) Additional loop-closure noise scaling (squared internally)
+
+    # Optional orientation calibration at start (IMU/heading)
+    use_orientation_calibration: false  # (bool) If true, estimate initial orientation from IMU/heading streams
+    orientation_calibration_size: 20    # (int)  Number of samples for the above calibration (if enabled)
+
+  # Near-keyframe loop-closure tunables
+  near_kf:
+    enabled: true                       # (bool) Enable near-keyframe loop closure detection
+    distance_threshold: 10.0     # (double, m) Consider keyframes within this radius as loop candidates
+    min_consecutive_kf_distance: 8.0  # (double, m) Minimum travel between two candidate keyframes (avoid trivial matches)
+    min_kf_seperation: 30        # (int) Minimum keyframe index separation to consider a loop (avoid immediate neighbors)
+
+  # --------------------------- Visualization --------------------------------------------------
+  visualize:
+    voxel_size: 0.3      # (double, m) Downsampling for published visualization clouds
+
+  # --------------------------- Misc -----------------------------------------------------------
+  lidar_type: "MID360"            # (string) Sensor model tag used by your code paths (e.g., MID360)

@@ -1,0 +1,12 @@
+# FAST-LIO (MID360) — node private namespace: /laserMapping
+# These are the parameters that were previously set directly in mapping_mid360.launch.
+# If you used additional parameters from fast_lio/config/mid360.yaml (e.g., extrinsics),
+# copy them here too so everything lives in this single file.
+
+feature_extract_enable: false     # (bool) If true, run feature extraction; FAST-LIO2 can work without this for livox
+point_filter_num: 3               # (int) Minimum neighbors for a point to be kept (simple outlier filter)
+max_iteration: 3                  # (int) Max solver iterations per optimization step (tracking robustness vs. speed)
+filter_size_surf: 0.5             # (double, meters) Voxel filter leaf size for surf feature downsampling
+filter_size_map: 0.5              # (double, meters) Voxel size for global/map downsampling (larger = faster, less detail)
+cube_side_length: 1000.0          # (double, meters) Side length of map cube (workspace size before rolling)
+runtime_pos_log_enable: false     # (bool) If true, log pose to disk during runtime

@@ -4,6 +4,7 @@
 
 struct PGOParams{
     struct sc{
+        bool enabled;
         double distance_threshold; // m
         double max_radius; // m
         double voxel_size; // m
@@ -35,11 +36,8 @@ struct PGOParams{
         bool use_orientation_calibration;
         int orientation_calibration_size;
     } graph;
-    struct loop_closure{
-        bool use_scancontrol;
-        bool use_near_kf;
-    } loop_closure;
     struct near_kf{
+        bool enabled;
         double distance_threshold;
         double min_consecutive_kf_distance;
         int min_kf_seperation;

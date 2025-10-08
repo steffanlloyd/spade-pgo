@@ -99,7 +99,7 @@ int PoseGraphManager::addKeyframe(const Eigen::Isometry3d &T, pcl::PointCloud<Po
 
     // Add to scancontext
     // TO DO: Fix this scancontrol stuff
-    if(this->params->loop_closure.use_scancontrol){
+    if(this->params->sc.enabled){
         // Downsample input point cloud from pointcloud according to voxel for SC
         pcl::PointCloud<PointType>::Ptr pointcloud_downsampled_sc(new pcl::PointCloud<PointType>());
         this->voxelizer_sc_.setInputCloud(pointcloud);
