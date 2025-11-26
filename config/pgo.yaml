@@ -41,9 +41,9 @@ spade_pgo:
     use_gnss_altitude: true # (bool)  Fuse GNSS altitude (Z). Disable if your Z is handled elsewhere
     gnss_min_initialization_distance: 15.0  # (double, m) Distance to travel before enabling GNSS fusion (avoid early-map instability)
     gps_noise_threshold: 20  # (double) Max covariance allowed for accepting a GNSS fix (pre-scale). Set to large number to disable filtering.
-    gps_noise_scale: 5.0         # (double) Variance scaling for GNSS XY; effective variance = (scale)^2 * covariance
-    gps_noise_z_scale: 1.0e2       # (double) Variance scaling for GNSS Z (altitude); squared internally as well
-    loop_closure_noise_scale: 1.0e-2   # (double) Additional loop-closure noise scaling (squared internally)
+    gps_noise_scale: 25.0         # (double) Variance scaling for GNSS XY; effective variance = (scale)^2 * covariance
+    gps_noise_z_scale: 25.0e0       # (double) Variance scaling for GNSS Z (altitude); squared internally as well
+    loop_closure_noise_scale: 1.0e-0   # (double) Additional loop-closure noise scaling (squared internally)
 
     # Optional orientation calibration at start (IMU/heading)
     use_orientation_calibration: false  # (bool) If true, estimate initial orientation from IMU/heading streams

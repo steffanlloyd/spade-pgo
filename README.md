@@ -36,7 +36,7 @@ Then, just play back your rosbag.
 
 To assemble the bag, run the python script (within the docker) after the run
 ```
-python3 ~/ros1_ws/src/vertliner-spade/SC-PGO/utils/python/makeMergedMap.py -i ~/save/pointclouds
+python3 ~/ros1_ws/src/spade-pgo/utils/python/makeMergedMap.py -i ~/save/pointclouds
 ```
 A map file called `map.las` will be saved in the same folder as the input (`~/save/pointclouds`).
 
