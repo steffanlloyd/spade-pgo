@@ -12,7 +12,6 @@
 #include "spade_pgo/common.hpp"
 #include "spade_pgo/geometry.hpp"
 #include "spade_pgo/PGOParams.hpp"
-#include "spade_pgo/OrientationInitializer.hpp"
 #include "spade_pgo/LoopClosureManager.hpp"
 #include "scancontext/Scancontext.h"
 
@@ -35,10 +34,7 @@
 #include <gtsam/geometry/Pose3.h>
 
 // GeographicLib
-// #include <GeographicLib/UTMUPS.hpp>
-// #include <GeographicLib/Geocentric.hpp>
 #include <GeographicLib/LocalCartesian.hpp>
-// #include <GeographicLib/Geoid.hpp>
 
 #include "scancontext/Scancontext.h"
 
@@ -51,8 +47,7 @@ using namespace spade_pgo;
  */
 PoseGraphManager::PoseGraphManager(
     std::shared_ptr<PGOParams> params
-) : params(params),
-    orienter(std::make_unique<OrientationInitializer>(params->graph.orientation_calibration_size))
+) : params(params)
 {
     // Build isam optimizer
     gtsam::ISAM2Params isam_params;
@@ -361,33 +356,70 @@ void PoseGraphManager::addGNSSFactor(int kf_index, nav_msgs::Odometry::ConstPtr 
 
     last_gps = gnss_odom;
 
-    // Build gtsam pose and noise
+    // Check if orientation is provided (non-zero orientation covariance indicates orientation is set)
+    bool has_orientation = (gnss_pose.covariance[35] > 0);  // Check yaw variance
+
+    // Log the GPS measurement position
     gtsam::Point3 gnss_pnt(gnss_pose.pose.position.x, gnss_pose.pose.position.y, gnss_pose.pose.position.z);
-    gtsam::Vector gnss_noise(3);
-    gnss_noise << gnss_pose.covariance[0], gnss_pose.covariance[7], gnss_pose.covariance[14];
-    gnss_noise *= (this->params->graph.gps_noise_scale*this->params->graph.gps_noise_scale); // Scale by square of scaling factor
-    gnss_noise(2) *= (this->params->graph.gps_noise_z_scale*this->params->graph.gps_noise_z_scale); // Further scale the z-factor by the scaling factor squared.
-
-    // Adjust noise on z-vector if not using GPS altitude
-    if( !this->params->graph.use_gnss_altitude ) gnss_noise(2) = 1e10; // OR 1e10
-
-    // At first iteration, artificially reduce the gps noise to lock the map in place.
-    // if(!this->gnss_initialized_ && this->gnss_factor_buffer_.size() == 0){
-    //     gnss_noise *= 1e-6;
-    // }
-
-    // Build gps factor
-    gtsam::noiseModel::Diagonal::shared_ptr gnss_noise_model = gtsam::noiseModel::Diagonal::Variances(gnss_noise);
-
-    // Log the GPS measurement
     {
         std::lock_guard<std::mutex> lock(this->kf_mtx_);
         this->kf_gnss_.resize(kf_index+1, std::nullopt);
         this->kf_gnss_.at(kf_index) = gnss_pnt.vector();
     }
 
-    // Make factor
-    auto gnss_factor = gtsam::GPSFactor(kf_index, gnss_pnt, gnss_noise_model);
+    // Build the factor based on whether we have orientation
+    gtsam::NonlinearFactor::shared_ptr factor;
+    
+    if (has_orientation) {
+        // Full 6DOF pose factor
+        gtsam::Rot3 gnss_rot(gtsam::Quaternion(
+            gnss_pose.pose.orientation.w,
+            gnss_pose.pose.orientation.x,
+            gnss_pose.pose.orientation.y,
+            gnss_pose.pose.orientation.z
+        ));
+        gtsam::Pose3 gnss_pose3(gnss_rot, gnss_pnt);
+
+        // Build 6DOF noise model (rot_x, rot_y, rot_z, x, y, z)
+        gtsam::Vector6 noise_sigmas;
+        
+        // Rotation noise (from covariance diagonal, take sqrt for sigma)
+        noise_sigmas(0) = std::sqrt(gnss_pose.covariance[21]);  // roll
+        noise_sigmas(1) = std::sqrt(gnss_pose.covariance[28]);  // pitch
+        noise_sigmas(2) = std::sqrt(gnss_pose.covariance[35]);  // yaw
+
+        // Position noise
+        noise_sigmas(3) = std::sqrt(gnss_pose.covariance[0]) * this->params->graph.gps_noise_scale;   // x
+        noise_sigmas(4) = std::sqrt(gnss_pose.covariance[7]) * this->params->graph.gps_noise_scale;   // y
+        noise_sigmas(5) = std::sqrt(gnss_pose.covariance[14]) * this->params->graph.gps_noise_scale * this->params->graph.gps_noise_z_scale;  // z
+
+        // Disable altitude constraint if configured
+        if (!this->params->graph.use_gnss_altitude) {
+            noise_sigmas(5) = 1e5;  // Very large uncertainty = effectively disabled
+        }
+
+        auto noise_model = gtsam::noiseModel::Diagonal::Sigmas(noise_sigmas);
+        factor = boost::make_shared<gtsam::PriorFactor<gtsam::Pose3>>(kf_index, gnss_pose3, noise_model);
+
+        ROS_DEBUG("Adding GNSS+Orientation factor at kf %d: pos=(%.2f, %.2f, %.2f), has orientation", 
+                  kf_index, gnss_pnt.x(), gnss_pnt.y(), gnss_pnt.z());
+    } else {
+        // Position-only GPS factor (original behavior)
+        gtsam::Vector3 gnss_noise;
+        gnss_noise << gnss_pose.covariance[0], gnss_pose.covariance[7], gnss_pose.covariance[14];
+        gnss_noise *= (this->params->graph.gps_noise_scale * this->params->graph.gps_noise_scale);
+        gnss_noise(2) *= (this->params->graph.gps_noise_z_scale * this->params->graph.gps_noise_z_scale);
+
+        if (!this->params->graph.use_gnss_altitude) {
+            gnss_noise(2) = 1e5; // Very large uncertainty = effectively disabled
+        }
+
+        auto gnss_noise_model = gtsam::noiseModel::Diagonal::Variances(gnss_noise);
+        factor = boost::make_shared<gtsam::GPSFactor>(kf_index, gnss_pnt, gnss_noise_model);
+
+        ROS_DEBUG("Adding GPS factor (position only) at kf %d: pos=(%.2f, %.2f, %.2f)", 
+                  kf_index, gnss_pnt.x(), gnss_pnt.y(), gnss_pnt.z());
+    }
 
     // Add GNSS factor to graph
     {
@@ -395,7 +427,7 @@ void PoseGraphManager::addGNSSFactor(int kf_index, nav_msgs::Odometry::ConstPtr 
 
         if(this->gnss_initialized_){
             // GNSS is already initalized, just add it normally
-            this->graph.add(gnss_factor);
+            this->graph.add(factor);
             ROS_DEBUG("Logging GPS measurement (to graph), kf %d: x = %.2f, y = %.2f, z = %.2f.", kf_index, gnss_pnt.x(), gnss_pnt.y(), gnss_pnt.z());
 
         }else{
@@ -409,11 +441,12 @@ void PoseGraphManager::addGNSSFactor(int kf_index, nav_msgs::Odometry::ConstPtr 
                     this->gnss_factor_buffer_.pop();
                 }
                 
+                this->graph.add(factor);
                 this->gnss_initialized_ = true;
                 this->triggerExtraOptimization();
             }else{
                 // Just add the GNS Factor to the queue
-                this->gnss_factor_buffer_.push(gnss_factor);
+                this->gnss_factor_buffer_.push(factor);
                 ROS_DEBUG("Logging GPS measurement (to queue), kf %d: x = %.2f, y = %.2f, z = %.2f. Distance travelled: %.2f", kf_index, gnss_pnt.x(), gnss_pnt.y(), gnss_pnt.z(), this->distanceTravelledGNSS_());
             }
         }
@@ -472,8 +505,14 @@ void PoseGraphManager::processData(DataPoint data)
         // We need to try initialize the graph.
         // We can only do this if: the calibration buffer is full, and
         // the current pose has a GPS pose.
-        if(this->params->graph.use_gnss && !data.gnss_msg.has_value() ){
+        if(this->params->useGNSS() && !data.gnss_msg.has_value() ){
             ROS_WARN_THROTTLE(5, "Waiting for a GNSS sample before initializing graph.");
+            return;
+        }
+
+        // Check orientation requirement (only if external orientation is enabled)
+        if(this->params->useExternalOrientation() && !data.orientation_msg.has_value()){
+            ROS_WARN_THROTTLE(5, "Waiting for orientation message before initializing graph.");
             return;
         }
 
@@ -482,25 +521,22 @@ void PoseGraphManager::processData(DataPoint data)
 
         // Make the "first pose" from the orientation and position
         this->T0_ = Eigen::Isometry3d::Identity();
-        if(this->params->graph.use_orientation_calibration){
-            auto orientationOptional = this->orienter->getOrientation();
-            if(! orientationOptional.has_value()){
-                ROS_WARN_THROTTLE(5, "Waiting for OrientationInitilizer buffer to fill before initializing graph.");
-                return;
-            }
-            this->T0_.linear() = orientationOptional.value();
-        } // Otherwise, just use the identy orientation
+        if(this->params->useExternalOrientation() && data.orientation_msg.has_value()){
+            this->T0_.linear() = data.orientation_msg.value().toRotationMatrix();
+            ROS_INFO("Using external orientation for initial pose.");
+        }
+        // Otherwise, use identity orientation
         
-
         // Add keyframe to queue
         this->addKeyframe(this->T0_, pointcloud, data.timestamp_lio);
 
         // Add prior factor
         this->addPriorFactorandEstimate(this->T0_);
 
-        // Add GNSS and reset origin
-        if(this->params->graph.use_gnss) this->navSatFixToOdometry(data.gnss_msg.value(), true);
-        // this->addGNSSFactor(0, gnss_odom); // no need to add to graph, it will just be 0,0,0 (same as prior factor).
+        // Add GNSS and reset origin (only if GNSS is enabled)
+        if (this->params->useGNSS() && data.gnss_msg.has_value()) {
+            this->navSatFixToOdometry(data.gnss_msg.value(), data.orientation_msg, true);
+        }
 
         ROS_INFO("Initialized graph with prior factor: %s", isometryToStr(this->T0_).c_str());
         return;
@@ -544,8 +580,13 @@ void PoseGraphManager::processData(DataPoint data)
     this->addOdometryFactorAndEstimate(current_kf_index, T_delta, T_kf_updated);
 
     // Add GNSS, if one is available    
-    if (data.gnss_msg){
-        auto gnss_odom = this->navSatFixToOdometry(data.gnss_msg.value());
+    if (this->params->useGNSS() && data.gnss_msg.has_value()) {
+        // Pass orientation if available
+        auto gnss_odom = this->navSatFixToOdometry(
+            data.gnss_msg.value(), 
+            data.orientation_msg,  // Pass current orientation (may be nullopt)
+            false  // resetOrigin
+        );
         this->addGNSSFactor(current_kf_index, gnss_odom);
     }
 
@@ -656,44 +697,66 @@ pcl::PointCloud<PointType>::Ptr PoseGraphManager::assembleGlobalPointCloud(int f
  * using the latitude, longitude, and altitude from the NavSatFix message and stores this as the GNSS origin.
  *
  * @param nav_sat_fix A shared pointer to the constant NavSatFix message containing GNSS data.
+ * @param orientation An optional quaternion representing the orientation to be used in the Odometry message.
+ * @param resetOrigin A boolean flag indicating whether to reset the GNSS origin.
  * @return nav_msgs::Odometry::ConstPtr A constant shared pointer to the resulting Odometry message.
  */
-nav_msgs::Odometry::ConstPtr PoseGraphManager::navSatFixToOdometry(const sensor_msgs::NavSatFix::ConstPtr& nav_sat_fix, bool resetOrigin)
+nav_msgs::Odometry::ConstPtr PoseGraphManager::navSatFixToOdometry(
+    const sensor_msgs::NavSatFix::ConstPtr& nav_sat_fix,
+    std::optional<Eigen::Quaterniond> orientation, 
+    bool resetOrigin)
 {
     if (!this->gnss_origin_.has_value() || resetOrigin)
     {
         this->geo_converter_.Reset(nav_sat_fix->latitude, nav_sat_fix->longitude, nav_sat_fix->altitude);
         this->gnss_origin_ = Eigen::Vector3d(nav_sat_fix->latitude, nav_sat_fix->longitude, nav_sat_fix->altitude);
-        ROS_INFO("Reset local coordinate frame origin to: lat: %.2f, long: %.2f, altitude: %.2f m.", nav_sat_fix->latitude, nav_sat_fix->longitude, nav_sat_fix->altitude);
+        ROS_INFO("Reset local coordinate frame origin to: lat: %.2f, long: %.2f, altitude: %.2f m.", 
+                 nav_sat_fix->latitude, nav_sat_fix->longitude, nav_sat_fix->altitude);
     }
 
-    // Create an Odometry message
     nav_msgs::Odometry odom;   
-    odom.header.frame_id = "map";   // Set the frame ID
-    odom.header.stamp = nav_sat_fix->header.stamp; // Use the timestamp from NavSatFix
+    odom.header.frame_id = "map";
+    odom.header.stamp = nav_sat_fix->header.stamp;
 
-    // Set the position in the Odometry message
-    this->geo_converter_.Forward(nav_sat_fix->latitude, nav_sat_fix->longitude, nav_sat_fix->altitude, odom.pose.pose.position.x, odom.pose.pose.position.y, odom.pose.pose.position.z);
+    // Set position
+    this->geo_converter_.Forward(nav_sat_fix->latitude, nav_sat_fix->longitude, nav_sat_fix->altitude, 
+                                 odom.pose.pose.position.x, odom.pose.pose.position.y, odom.pose.pose.position.z);
 
-    // Set an identity orientation if orientation information is not available
-    odom.pose.pose.orientation.w = 1.0;
+    // Set orientation - use provided quaternion or identity
+    if (orientation.has_value()) {
+        const auto& q = orientation.value();
+        odom.pose.pose.orientation.w = q.w();
+        odom.pose.pose.orientation.x = q.x();
+        odom.pose.pose.orientation.y = q.y();
+        odom.pose.pose.orientation.z = q.z();
+    } else {
+        odom.pose.pose.orientation.w = 1.0;
+        odom.pose.pose.orientation.x = 0.0;
+        odom.pose.pose.orientation.y = 0.0;
+        odom.pose.pose.orientation.z = 0.0;
+    }
 
-    // Copy covariances from NavSatFix
-    // Assuming the covariances in NavSatFix are already in the correct units
-    odom.pose.covariance[0] = nav_sat_fix->position_covariance[0];  // Variance in X (easting)
-    odom.pose.covariance[7] = nav_sat_fix->position_covariance[4];  // Variance in Y (northing)
-    odom.pose.covariance[14] = nav_sat_fix->position_covariance[8]; // Variance in Z (altitude)
+    // Position covariances from NavSatFix
+    odom.pose.covariance[0] = nav_sat_fix->position_covariance[0];   // X variance
+    odom.pose.covariance[7] = nav_sat_fix->position_covariance[4];   // Y variance
+    odom.pose.covariance[14] = nav_sat_fix->position_covariance[8];  // Z variance
 
-    // Set all other covariances to zero (you can modify this if you have specific correlations or uncertainties)
+    // Orientation covariances - use fixed values when orientation is provided
+    // These go in indices 21 (roll), 28 (pitch), 35 (yaw) for a 6x6 covariance matrix
+    if (orientation.has_value()) {
+        // Set orientation uncertainty - tune these based on your orientation source
+        odom.pose.covariance[21] = this->params->graph.orientation_noise*this->params->graph.orientation_noise;  // roll
+        odom.pose.covariance[28] = this->params->graph.orientation_noise*this->params->graph.orientation_noise;  // pitch
+        odom.pose.covariance[35] = this->params->graph.orientation_noise*this->params->graph.orientation_noise;  // yaw
+    }
+
+    // Zero out cross-correlations
     for (size_t i = 0; i < odom.pose.covariance.size(); ++i) {
-        if (i != 0 && i != 7 && i != 14) {
+        if (i != 0 && i != 7 && i != 14 && i != 21 && i != 28 && i != 35) {
             odom.pose.covariance[i] = 0.0;
         }
     }
 
-    // Create a shared pointer to the Odometry object
     nav_msgs::Odometry::Ptr odom_ptr = boost::make_shared<nav_msgs::Odometry>(odom);
-
-    // Return a ConstPtr from that
     return nav_msgs::Odometry::ConstPtr(odom_ptr);
 }

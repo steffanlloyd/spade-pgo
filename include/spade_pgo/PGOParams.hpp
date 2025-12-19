@@ -25,16 +25,14 @@ struct PGOParams{
         double kf_gap_lin; // m
         double kf_gap_rot; // rad
         double lio_noise_rot; // rad
-        double lio_noise_lin;
-        bool use_gnss;
+        double lio_noise_lin; // m
+        double orientation_noise; // rad
         bool use_gnss_altitude;
         double gnss_min_initialization_distance;
         double gps_noise_threshold;
         double gps_noise_scale;
         double gps_noise_z_scale;
         double loop_closure_noise_scale;
-        bool use_orientation_calibration;
-        int orientation_calibration_size;
     } graph;
     struct near_kf{
         bool enabled;
@@ -46,11 +44,15 @@ struct PGOParams{
         double voxel_size;
     } visualize;
     struct ros{
-        std::string gps_topic;
+        std::string gps_topic;          // Empty string "" disables GNSS
+        std::string orientation_topic;  // Empty string "" disables external orientation
+        std::string orientation_msg_type; // "odometry" or "quaternion"
         std::string pointcloud_topic;
-        std::string odometry_topic;
-        std::string heading_topic;
-        std::string imu_topic;
+        std::string lio_odometry_topic;
         std::string save_directory;
     } ros;
+    
+    // Helper methods to check if features are enabled
+    bool useGNSS() const { return !ros.gps_topic.empty(); }
+    bool useExternalOrientation() const { return !ros.orientation_topic.empty(); }
 };

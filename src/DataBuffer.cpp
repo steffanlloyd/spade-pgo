@@ -62,6 +62,37 @@ void DataBuffer::pushGNSS(const sensor_msgs::NavSatFix::ConstPtr &gps)
     this->gnss_buffer_.push(gps);
 }
 
+/**
+ * @brief Pushes an orientation message into the orientation buffer (from an odometry message).
+ * 
+ * @param odom A constant pointer to the odometry message to be pushed into the buffer.
+ */
+void DataBuffer::pushOrientation(const nav_msgs::Odometry::ConstPtr& odom)
+{
+    std::lock_guard<std::mutex> lock(buffer_mutex_);
+    Eigen::Quaterniond q(
+        odom->pose.pose.orientation.w,
+        odom->pose.pose.orientation.x,
+        odom->pose.pose.orientation.y,
+        odom->pose.pose.orientation.z
+    );
+    this->orientation_buffer_.push(q.normalized());
+}
+
+
+/**
+ * @brief Pushes an orientation message into the orientation buffer (from a quaternion message).
+ * 
+ * @param quat A constant pointer to the quaternion message to be pushed into the buffer.
+ */
+void DataBuffer::pushOrientation(const geometry_msgs::Quaternion::ConstPtr& quat)
+{
+    std::lock_guard<std::mutex> lock(buffer_mutex_);
+    Eigen::Quaterniond q(quat->w, quat->x, quat->y, quat->z);
+    this->orientation_buffer_.push(q.normalized());
+}
+
+
 
 /**
  * @brief Pops synchronized odometry and point cloud data from the buffers.
@@ -88,32 +119,42 @@ std::optional<DataPoint> DataBuffer::popDataPoint()
     
     // After synchronization, verify buffers are still non-empty.
     if (! this->dataAvailable()) return std::nullopt;
+
+    DataPoint data;
     
     // Extract the odometry timestamp.
-    double timestamp_lio = this->odom_buffer_.front()->header.stamp.toSec();
-    double timestamp_laser = this->cloud_buffer_.front()->header.stamp.toSec();
+    data.timestamp_lio = this->odom_buffer_.front()->header.stamp.toSec();
+    data.timestamp_laser = this->cloud_buffer_.front()->header.stamp.toSec();
 
     // Find a nearby GNSS message
-    std::optional<sensor_msgs::NavSatFix::ConstPtr> gnss_msg;
     while (!this->gnss_buffer_.empty()) {
         auto msg = this->gnss_buffer_.front();
         this->gnss_buffer_.pop();
-        if( abs(msg->header.stamp.toSec() - timestamp_lio) < this->gnssAllowedTimeDelta ) {
-            gnss_msg = msg;
+        if( abs(msg->header.stamp.toSec() - data.timestamp_lio) < this->gnssAllowedTimeDelta ) {
+            data.gnss_msg = msg;
             break;
+        }
+    }
+
+    // Get latest orientation if available
+    if (!this->orientation_buffer_.empty()) {
+        data.orientation_msg = this->orientation_buffer_.back();
+        // Clear old orientations, keep only the most recent
+        while (orientation_buffer_.size() > 1) {
+            orientation_buffer_.pop();
         }
     }
     
     // Convert the full-resolution cloud message to a PCL point cloud.
-    pcl::PointCloud<PointType>::Ptr cloud(new pcl::PointCloud<PointType>());
-    pcl::fromROSMsg(*this->cloud_buffer_.front(), *cloud);
+    data.pointcloud = boost::make_shared<pcl::PointCloud<PointType>>();
+    pcl::fromROSMsg(*this->cloud_buffer_.front(), *data.pointcloud);
     this->cloud_buffer_.pop();
     
     // Convert the odometry message to an Isometry3d.
-    Eigen::Isometry3d T_odom = this->odomMsgToIsometry(*this->odom_buffer_.front());
+    data.T_odom = this->odomMsgToIsometry(*this->odom_buffer_.front());
     this->odom_buffer_.pop();
     
-    return std::make_optional(DataPoint{timestamp_lio, timestamp_laser, cloud, T_odom, gnss_msg});
+    return std::move(data);
 }
 
 /**

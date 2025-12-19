@@ -12,7 +12,6 @@
 #include "spade_pgo/common.hpp"
 #include "spade_pgo/PGOParams.hpp"
 #include "spade_pgo/DataBuffer.hpp"
-#include "spade_pgo/OrientationInitializer.hpp"
 
 // ROS includes
 #include <ros/ros.h>
@@ -65,7 +64,12 @@ public:
     void addGNSSFactor(int kf_index, nav_msgs::Odometry::ConstPtr gnss_odom);
     void addLoopClosureFactor(int kf_index_1, int kf_index_2, Eigen::Isometry3d Ticp, double fitnessScore);
 
-    nav_msgs::Odometry::ConstPtr navSatFixToOdometry(const sensor_msgs::NavSatFix::ConstPtr& nav_sat_fix, bool resetOrigin = false);
+    nav_msgs::Odometry::ConstPtr navSatFixToOdometry(
+        const sensor_msgs::NavSatFix::ConstPtr& nav_sat_fix, 
+        std::optional<Eigen::Quaterniond> orientation = std::nullopt,
+        bool resetOrigin = false
+    );
+
 
     void optimizeGraph();
     void savePointCloud(int kf_index, pcl::PointCloud<PointType>::Ptr pointcloud, double timestamp) const;
@@ -76,7 +80,6 @@ public:
     gtsam::NonlinearFactorGraph graph;
     DataBuffer data_buffer;
     std::shared_ptr<PGOParams> params;
-    std::unique_ptr<OrientationInitializer> orienter;
     std::vector<pcl::PointCloud<PointType>::Ptr> kf_pointclouds; 
 
 private:
@@ -98,7 +101,7 @@ private:
     std::vector<Eigen::Isometry3d> kf_poses_updated_;
     std::vector<std::optional<Eigen::Vector3d>> kf_gnss_;
     std::vector<double> kf_timestamps_;
-    std::queue<gtsam::GPSFactor> gnss_factor_buffer_;
+    std::queue<gtsam::NonlinearFactor::shared_ptr> gnss_factor_buffer_;
     bool graph_initialized_ = false;
     bool gnss_initialized_ = false;
     std::optional<Eigen::Vector3d> gnss_origin_; // Will store values as lat, long, altitude

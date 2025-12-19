@@ -23,7 +23,7 @@
 #include <std_msgs/Float64.h>
 #include <sensor_msgs/PointCloud2.h>
 #include <sensor_msgs/NavSatFix.h>
-#include <sensor_msgs/MagneticField.h>
+#include <geometry_msgs/Quaternion.h>
 #include <tf/transform_datatypes.h>
 #include <tf/transform_broadcaster.h>
 #include <nav_msgs/Odometry.h>
@@ -45,7 +45,6 @@ std::shared_ptr<LoopClosureManager> loop_closure_manager;
 
 void process_pg()
 {
-    // SL: Start infinite loop
     while(1)
     {
         // While odometry buffer and laser scan buffer (full res) are not empty.
@@ -115,7 +114,6 @@ void process_isam(void)
 // Publish visualization map at a given frequency
 void process_viz_map(void)
 {
-    // SL (Q): vizmapFrequency should be a ROS parameter
     float vizmapFrequency = 0.1; // 0.1 means run onces every 10s
     ros::Rate rate(vizmapFrequency);
     while (ros::ok()) {
@@ -150,15 +148,13 @@ int main(int argc, char **argv)
     nh.param<double>("spade_pgo/graph/lio_noise_rot", params->graph.lio_noise_rot, 1e-2); // Std of noise from LIO (rad)
     nh.param<double>("spade_pgo/graph/prior_noise_lin", params->graph.prior_noise_lin, 5); // Prior noise from gps/imu initial pose estimate (m)
     nh.param<double>("spade_pgo/graph/prior_noise_rot", params->graph.prior_noise_rot, 0.2); // Prior noise from gps/imu initial pose estimate (rad)
-    nh.param<bool>("spade_pgo/graph/use_gnss", params->graph.use_gnss, true); // Use GPS or not
     nh.param<bool>("spade_pgo/graph/use_gnss_altitude", params->graph.use_gnss_altitude, true); // Use GPS altitude
     nh.param<double>("spade_pgo/graph/gps_noise_threshold", params->graph.gps_noise_threshold, 4.0); // Covariance threshold for gps measurement to be taken into account (before applying scaling factor)
     nh.param<double>("spade_pgo/graph/gps_noise_scale", params->graph.gps_noise_scale, 1.0); // Scaling factor added to GPS variance. Value will be squared, so 2x value is 2x less certainty
     nh.param<double>("spade_pgo/graph/gps_noise_z_scale", params->graph.gps_noise_z_scale, 1e2); // Scaling factor added to GPS altitude variance. Value will be squared, so 2x value is 2x less certainty
+    nh.param<double>("spade_pgo/graph/orientation_noise", params->graph.orientation_noise, 0.1);
     nh.param<double>("spade_pgo/graph/gnss_min_initialization_distance", params->graph.gnss_min_initialization_distance, 5); // Min distance travelled before GNSS will initialize (too small will destabilize map. Should be higher than covariance of GNSS)
     nh.param<double>("spade_pgo/graph/loop_closure_noise_scale", params->graph.loop_closure_noise_scale, 1); // Loop Noise scaling factor. Value will be squared
-    nh.param<int>("spade_pgo/graph/orientation_calibration_size", params->graph.orientation_calibration_size, 20); // Number of samples from the imu and heading to calculate the initial pose
-    nh.param<bool>("spade_pgo/graph/use_orientation_calibration", params->graph.use_orientation_calibration, true); // Whether or not to use the orientation calibration procedue. If yes, must specify an IMU and heading stream.
 
     // ScanControl parameters
     nh.param<bool>("spade_pgo/sc/enabled", params->sc.enabled, false);
@@ -166,27 +162,35 @@ int main(int argc, char **argv)
 	nh.param<double>("spade_pgo/sc/max_radius",  params->sc.max_radius, 25.0); // 80 is recommended for outdoor, and lower (ex, 20, 40) values are recommended for indoor 
     nh.param<double>("spade_pgo/sc/voxel_size", params->sc.voxel_size, 0.4); // Scan Context point cloud downsampling
     
-    // Near KF loop closure commands
+    // Near KF loop closure params
     nh.param<bool>("spade_pgo/near_kf/enabled", params->near_kf.enabled, false);
     nh.param<double>("spade_pgo/near_kf/distance_threshold", params->near_kf.distance_threshold, 10); // Distance that implies a potential match
     nh.param<double>("spade_pgo/near_kf/min_consecutive_kf_distance", params->near_kf.min_consecutive_kf_distance, 5); // Minimum distance between keyframes to be matched for loop closure (from another tested point)
     nh.param<int>("spade_pgo/near_kf/min_kf_seperation", params->near_kf.min_kf_seperation, 30); // Minimum number of keyframes between the two keyframes to be matched for loop closure (from another tested point)
 
     // Visualization parameters
-	nh.param<double>("spade_pgo/visualize/voxel_size", params->visualize.voxel_size, 0.4); // pose assignment every k frames 
+	nh.param<double>("spade_pgo/visualize/voxel_size", params->visualize.voxel_size, 0.4); 
 
     // ROS parameters
-    nh.param<std::string>("spade_pgo/ros/gps_topic", params->ros.gps_topic, "/mavros/global_position/global");
+    nh.param<std::string>("spade_pgo/ros/gps_topic", params->ros.gps_topic, ""); // Empty = disabled
+    nh.param<std::string>("spade_pgo/ros/orientation_topic", params->ros.orientation_topic, "");  //  Empty = disabled. Must be in ENU frame
+    nh.param<std::string>("spade_pgo/ros/orientation_msg_type", params->ros.orientation_msg_type, "odometry"); // "odometry" or "quaternion"
 	nh.param<std::string>("spade_pgo/ros/pointcloud_topic", params->ros.pointcloud_topic, "/cloud_registered_body"); // Should be local frame (registered to the sensor body)
-	nh.param<std::string>("spade_pgo/ros/odometry_topic", params->ros.odometry_topic, "/Odometry");
-    nh.param<std::string>("spade_pgo/ros/imu_topic", params->ros.imu_topic, "/mavros/imu/data");
-    nh.param<std::string>("spade_pgo/ros/heading_topic", params->ros.heading_topic, "/mavros/global_position/compass_hdg");
+	nh.param<std::string>("spade_pgo/ros/lio_odometry_topic", params->ros.lio_odometry_topic, "/Odometry");
     nh.param<std::string>("spade_pgo/ros/save_directory", params->ros.save_directory, "/home/ros/save/pointclouds/");
 
-    int ret1 = system((std::string("exec rm -r ") + params->ros.save_directory).c_str());
+    // Log which optional features are enabled
+    ROS_INFO("GNSS integration: %s", params->useGNSS() ? "ENABLED" : "DISABLED");
+    ROS_INFO("External orientation: %s", params->useExternalOrientation() ? "ENABLED" : "DISABLED");
+
+    // Create save directories (fixed error check - don't fail on rm of non-existent dir)
+    int ret1 = system((std::string("exec rm -r ") + params->ros.save_directory + " 2>/dev/null").c_str());
+    (void)ret1;  // Ignore - directory may not exist
     int ret2 = system((std::string("mkdir -p ") + params->ros.save_directory).c_str());
-    int ret3 = system((std::string("mkdir -p ") + params->ros.save_directory  + "scans/").c_str());
-    if (ret1!=0 || ret2!=0 || ret3!=0) ROS_ERROR("Could not reset and create the scan directory %s.", params->ros.save_directory.c_str());
+    int ret3 = system((std::string("mkdir -p ") + params->ros.save_directory + "scans/").c_str());
+    if (ret2 != 0 || ret3 != 0) {
+        ROS_ERROR("Could not create the scan directory %s.", params->ros.save_directory.c_str());
+    }
 
     graph_manager = std::make_shared<PoseGraphManager>(params);
     visualizer = std::make_shared<Visualizer>(graph_manager, nh, params);
@@ -194,7 +198,8 @@ int main(int argc, char **argv)
     visualizer->setLoopClosureManager(loop_closure_manager);
     graph_manager->setLoopClosureManager(loop_closure_manager);
 
-	ros::Subscriber subscriber_pointcloud = nh.subscribe<sensor_msgs::PointCloud2>(
+    // Point cloud subscriber
+    ros::Subscriber subscriber_pointcloud = nh.subscribe<sensor_msgs::PointCloud2>(
         params->ros.pointcloud_topic, 100, 
         std::function<void(const sensor_msgs::PointCloud2ConstPtr&)>(
             [](const sensor_msgs::PointCloud2ConstPtr &cloud) {
@@ -202,50 +207,58 @@ int main(int argc, char **argv)
                 visualizer->publishSensorCloud(cloud);
             }
         ));
-	ros::Subscriber subscriber_lio_odometry = nh.subscribe<nav_msgs::Odometry>(
-        params->ros.odometry_topic, 100, 
+
+    // Odometry subscriber
+    ros::Subscriber subscriber_lio_odometry = nh.subscribe<nav_msgs::Odometry>(
+        params->ros.lio_odometry_topic, 100, 
         std::function<void(const nav_msgs::Odometry::ConstPtr&)>(
             [](const nav_msgs::Odometry::ConstPtr &odom) {
                 graph_manager->data_buffer.pushOdometry(odom);
             }
         ));
+
+    // GNSS subscriber (only if topic is specified)
     ros::Subscriber subscriber_gnss;
-    if(params->graph.use_gnss){
+    if (params->useGNSS()) {
         subscriber_gnss = nh.subscribe<sensor_msgs::NavSatFix>(
             params->ros.gps_topic, 100,
             std::function<void(const sensor_msgs::NavSatFix::ConstPtr&)>(
-                [&params](const sensor_msgs::NavSatFix::ConstPtr &gps) {
-                    if(params->graph.use_gnss){
-                        graph_manager->data_buffer.pushGNSS(gps);
-                    }
+                [](const sensor_msgs::NavSatFix::ConstPtr &gps) {
+                    graph_manager->data_buffer.pushGNSS(gps);
                 }
             ));
+        ROS_INFO("Subscribed to GNSS topic: %s", params->ros.gps_topic.c_str());
     }
-    // To do: Only make these subscribers if doing calibration
-    ros::Subscriber subscriber_heading = nh.subscribe<std_msgs::Float64>(
-        params->ros.heading_topic, 100,
-        std::function<void(const std_msgs::Float64::ConstPtr&)>(
-            [](const std_msgs::Float64::ConstPtr& msg) {
-                graph_manager->orienter->pushHeading(msg);
-            }
-        ));
-    ros::Subscriber subscriber_imu = nh.subscribe<sensor_msgs::Imu>(
-        params->ros.imu_topic, 100,
-        std::function<void(const sensor_msgs::Imu::ConstPtr&)>(
-            [](const sensor_msgs::Imu::ConstPtr& msg) {
-                graph_manager->orienter->pushIMU(msg);
-            }
-        ));	
+
+    // Orientation subscriber (only if topic is specified)
+    // Handles both Odometry and Quaternion message types via generic subscriber
+    ros::Subscriber subscriber_orientation;
+    if (params->useExternalOrientation()) {
+        if (params->ros.orientation_msg_type == "odometry") {
+            subscriber_orientation = nh.subscribe<nav_msgs::Odometry>(
+                params->ros.orientation_topic, 100,
+                std::function<void(const nav_msgs::Odometry::ConstPtr&)>(
+                    [](const nav_msgs::Odometry::ConstPtr& odom) {
+                        graph_manager->data_buffer.pushOrientation(odom);
+                    }
+                ));
+        } else {
+            subscriber_orientation = nh.subscribe<geometry_msgs::Quaternion>(
+                params->ros.orientation_topic, 100,
+                std::function<void(const geometry_msgs::Quaternion::ConstPtr&)>(
+                    [](const geometry_msgs::Quaternion::ConstPtr& quat) {
+                        graph_manager->data_buffer.pushOrientation(quat);
+                    }
+                ));
+        }
+        ROS_INFO("Subscribed to orientation topic: %s (type %s)", params->ros.orientation_topic.c_str(), params->ros.orientation_msg_type.c_str());
+    }
+
 
 	std::thread posegraph_slam {process_pg}; // pose graph construction
 	std::thread lc_detection {process_lcd}; // loop closure detection 
 	std::thread icp_calculation {process_icp}; // loop constraint calculation via icp 
-    // SL (Q): Should define ROS parameters to decide whether to run isam2 as you described below, or the other option.
-    // I'm not 100% sure I understand what you mean by "uncomment this and comment all the above runisam2opt when node is added".
 	std::thread isam_update {process_isam}; // if you want to call less isam2 run (for saving redundant computations and no real-time visulization is required), uncommment this and comment all the above runisam2opt when node is added. 
-
-    // SL (Q): Visualization update frequency should be a ros parameter. And then we can add logic that if that
-    // parameter is negative (e.g. -1), that means to not run it at all.
 	std::thread viz_map {process_viz_map}; // visualization - map (low frequency because it is heavy)
 	std::thread viz_path {process_viz_path}; // visualization - path (high frequency)
 
