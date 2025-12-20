@@ -61,7 +61,7 @@ PoseGraphManager::PoseGraphManager(
     this->voxelizer_save_.setLeafSize(voxel_size_save, voxel_size_save, voxel_size_save);
 
     // Setup outputs
-    this->pg_laser_timestamp_save_ = std::fstream(this->params->ros.save_directory + "laser_timestamps.txt", std::fstream::out); 
+    this->pg_laser_timestamp_save_ = std::fstream(this->params->ros.save_directory + "laser_timestamps.txt", std::fstream::out);
     this->pg_laser_timestamp_save_.precision(std::numeric_limits<double>::max_digits10);
 }
 
@@ -497,8 +497,11 @@ void PoseGraphManager::addLoopClosureFactor(int kf_prev, int kf_curr, Eigen::Iso
 void PoseGraphManager::processData(DataPoint data)
 {
     static Eigen::Isometry3d T_odom_prev;
-    Eigen::Isometry3d& T_odom = data.T_odom;
-    auto pointcloud = data.pointcloud;
+    // Note, need to change the frames to be in the same frame as the flight controller.
+    // These transforms have been checked!!
+    const auto& T_body_lidar = this->params->extrinsics.T_body_lidar;
+    auto T_odom = data.T_odom * T_body_lidar.inverse();
+    auto pointcloud = geometry::pclTransform(data.pointcloud, T_body_lidar.matrix());
 
     // If it's the first time this is run, set the "first" pose.
     if(! this->graphInitialized()){

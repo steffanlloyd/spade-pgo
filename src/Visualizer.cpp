@@ -161,7 +161,9 @@ void Visualizer::publishSensorCloud(const sensor_msgs::PointCloud2ConstPtr& ros_
     pcl::PointCloud<PointType>::Ptr cloud_transformed(new pcl::PointCloud<PointType>());
     pcl::fromROSMsg(*ros_cloud, *cloud);
 
-    * cloud_transformed = * geometry::pclTransform(cloud, this->graph_manager_->updatedPose(true).matrix());
+    // Transform from lidar frame to world frame: T_world_lidar = T_world_body * T_body_lidar
+    Eigen::Matrix4d T_world_lidar = this->graph_manager_->updatedPose(true).matrix() * this->params->extrinsics.T_body_lidar.matrix();
+    * cloud_transformed = * geometry::pclTransform(cloud, T_world_lidar);
 
     // Convert the point cloud to ROS message and publish
     sensor_msgs::PointCloud2 sensorCloudMsg;

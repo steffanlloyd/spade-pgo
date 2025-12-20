@@ -179,6 +179,21 @@ int main(int argc, char **argv)
 	nh.param<std::string>("spade_pgo/ros/lio_odometry_topic", params->ros.lio_odometry_topic, "/Odometry");
     nh.param<std::string>("spade_pgo/ros/save_directory", params->ros.save_directory, "/home/ros/save/pointclouds/");
 
+    // Extrinsics: lidar to body transform as [roll, pitch, yaw] in radians
+    std::vector<double> lidar_to_body_rpy;
+    nh.param<std::vector<double>>("spade_pgo/extrinsics/lidar_to_body_rpy", lidar_to_body_rpy, {0.0, 0.0, 0.0});
+    if (lidar_to_body_rpy.size() != 3) {
+        ROS_WARN("lidar_to_body_rpy must have exactly 3 elements [roll, pitch, yaw]. Using identity.");
+        lidar_to_body_rpy = {0.0, 0.0, 0.0};
+    }
+    params->extrinsics.T_body_lidar = Eigen::Isometry3d::Identity();
+    params->extrinsics.T_body_lidar.linear() =
+        (Eigen::AngleAxisd(lidar_to_body_rpy[2], Eigen::Vector3d::UnitZ()) *
+         Eigen::AngleAxisd(lidar_to_body_rpy[1], Eigen::Vector3d::UnitY()) *
+         Eigen::AngleAxisd(lidar_to_body_rpy[0], Eigen::Vector3d::UnitX())).toRotationMatrix();
+    ROS_INFO("Lidar-to-body extrinsics RPY [rad]: [%.3f, %.3f, %.3f]",
+             lidar_to_body_rpy[0], lidar_to_body_rpy[1], lidar_to_body_rpy[2]);
+
     // Log which optional features are enabled
     ROS_INFO("GNSS integration: %s", params->useGNSS() ? "ENABLED" : "DISABLED");
     ROS_INFO("External orientation: %s", params->useExternalOrientation() ? "ENABLED" : "DISABLED");

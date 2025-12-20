@@ -1,6 +1,7 @@
 #pragma once
 
 #include <string>
+#include <Eigen/Geometry>
 
 struct PGOParams{
     struct sc{
@@ -51,6 +52,9 @@ struct PGOParams{
         std::string lio_odometry_topic;
         std::string save_directory;
     } ros;
+    struct extrinsics{
+        Eigen::Isometry3d T_body_lidar = Eigen::Isometry3d::Identity();
+    } extrinsics;
     
     // Helper methods to check if features are enabled
     bool useGNSS() const { return !ros.gps_topic.empty(); }

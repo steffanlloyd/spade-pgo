@@ -70,7 +70,6 @@ public:
         bool resetOrigin = false
     );
 
-
     void optimizeGraph();
     void savePointCloud(int kf_index, pcl::PointCloud<PointType>::Ptr pointcloud, double timestamp) const;
     void saveGraphKeyframes() const;

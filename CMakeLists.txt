@@ -44,7 +44,6 @@ add_executable(spade_pgo_node
   src/LoopClosureManager.cpp
   src/NearKFDetector.cpp
   src/PoseGraphManager.cpp
-  src/OrientationInitializer.cpp
   src/ros_helpers.cpp
   src/Visualizer.cpp
   include/scancontext/Scancontext.cpp
