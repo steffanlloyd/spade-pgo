@@ -1,0 +1,8 @@
+# Request to re-initialize PGO session for a new drone
+# No request parameters - drone_id is automatically assigned
+---
+# Response
+bool success
+string message
+uint8 drone_id                  # Automatically assigned drone ID for the new session
+uint32 next_keyframe_index      # The keyframe index where the new session will start

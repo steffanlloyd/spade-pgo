@@ -49,13 +49,13 @@ pcl::PointCloud<PointType>::Ptr spade_pgo::geometry::pclTransform(const pcl::Poi
 {
     pcl::PointCloud<PointType>::Ptr cloudOut(new pcl::PointCloud<PointType>());
 
-    int cloudSize = pointcloud->size();
+    size_t cloudSize = pointcloud->size();
     cloudOut->resize(cloudSize);
     Eigen::Matrix4f T_float = T.cast<float>();
-    
-    int numberOfCores = 16;
+
+    int numberOfCores = std::min(omp_get_max_threads(), 16);  // Cap at 16 threads
     #pragma omp parallel for num_threads(numberOfCores)
-    for (int i = 0; i < cloudSize; ++i)
+    for (size_t i = 0; i < cloudSize; ++i)
     {
         const auto &pointFrom = pointcloud->points[i];
         cloudOut->points[i].x = T_float(0,0) * pointFrom.x + T_float(0,1) * pointFrom.y + T_float(0,2) * pointFrom.z + T_float(0,3);

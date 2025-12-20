@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <mutex>
 #include <queue>
 #include <vector>
@@ -52,14 +53,21 @@ public:
     std::vector<Eigen::Isometry3d> getUpdatedKFPoses() const;
     std::vector<std::optional<Eigen::Vector3d>> getGNSSPoints() const;
     std::vector<double> getKFTimestamps() const;
+    pcl::PointCloud<PointType>::Ptr getKeyframePointCloud(int index) const;
     void triggerExtraOptimization();
 
     void setCurrentPose(const Eigen::Isometry3d &pose);
     void setLoopClosureManager(std::shared_ptr<LoopClosureManager> lc_manager);
 
+    int reinitializeSession();
+    uint8_t getCurrentDroneId() const;
+    std::vector<uint8_t> getKeyframeDroneIds() const;
+    std::vector<std::pair<int, uint8_t>> getSessionBoundaries() const;
+    bool isGNSSInitialized() const;
+
     void processData(DataPoint data);
     int addKeyframe(const Eigen::Isometry3d &T, pcl::PointCloud<PointType>::Ptr &pointcloud, double time);
-    void addPriorFactorandEstimate(const Eigen::Isometry3d &T);
+    void addPriorFactorandEstimate(const Eigen::Isometry3d &T, int kf_id = -1);
     void addOdometryFactorAndEstimate(int kf_index, const Eigen::Isometry3d &T, Eigen::Isometry3d &T_est);
     void addGNSSFactor(int kf_index, nav_msgs::Odometry::ConstPtr gnss_odom);
     void addLoopClosureFactor(int kf_index_1, int kf_index_2, Eigen::Isometry3d Ticp, double fitnessScore);
@@ -104,7 +112,7 @@ private:
     bool graph_initialized_ = false;
     bool gnss_initialized_ = false;
     std::optional<Eigen::Vector3d> gnss_origin_; // Will store values as lat, long, altitude
-    bool trigger_extra_optimization_flag_ = false;
+    std::atomic<bool> trigger_extra_optimization_flag_{false};
     Eigen::Isometry3d T_curr_updated_ = Eigen::Isometry3d::Identity();
 
     std::queue<std::pair<Eigen::Isometry3d, pcl::PointCloud<PointType>::Ptr>> inter_kf_pointcloud_buffer_;
@@ -113,6 +121,16 @@ private:
     pcl::VoxelGrid<PointType> voxelizer_save_;
 
     mutable std::fstream pg_laser_timestamp_save_;
+
+    // Multi-drone session tracking
+    uint8_t current_drone_id_ = 0;
+    std::vector<uint8_t> kf_drone_ids_;
+    std::vector<int> session_start_indices_;
+    std::vector<uint8_t> session_drone_ids_;
+    bool awaiting_session_init_ = false;
+
+    // Odometry tracking (reset per session for multi-drone support)
+    Eigen::Isometry3d T_odom_prev_ = Eigen::Isometry3d::Identity();
 };
 
 }

@@ -66,7 +66,7 @@ PoseGraphManager::PoseGraphManager(
 }
 
 /**
- * @brief Adds a keyframe to the pose graph (consisting of, at a minimum, an odometry transform and pointcloud)
+ * @brief Adds a keyframe to the pose graph (consisting of, at a minimum, an transform estimate and pointcloud)
  * 
  * @param T The transformation matrix representing the pose of the keyframe.
  * @param pointcloud Pointer to the point cloud data associated with the keyframe.
@@ -87,8 +87,10 @@ int PoseGraphManager::addKeyframe(const Eigen::Isometry3d &T, pcl::PointCloud<Po
         this->kf_pointclouds.push_back(pointcloud_downsampled);
         this->kf_poses_odom_.push_back(T);
         this->kf_timestamps_.push_back(time);
+        // Track which drone session this keyframe belongs to (for multi-drone swarm processing)
+        this->kf_drone_ids_.push_back(this->current_drone_id_);
+        kf_id = this->kf_poses_odom_.size() - 1;
     }
-    kf_id = this->kf_poses_odom_.size() - 1;
 
     ROS_DEBUG("Added keyframe %d, estimated position: %s", kf_id, isometryToStr(T).c_str());
 
@@ -113,6 +115,7 @@ int PoseGraphManager::addKeyframe(const Eigen::Isometry3d &T, pcl::PointCloud<Po
  */
 bool PoseGraphManager::graphInitialized() const
 {
+    std::lock_guard<std::mutex> lock(this->kf_mtx_);
     return this->kf_poses_odom_.size() > 0;
 }
 
@@ -158,6 +161,7 @@ Eigen::Isometry3d PoseGraphManager::updatedPose(bool live) const
  */
 int PoseGraphManager::currentKFIndex() const
 {
+    std::lock_guard<std::mutex> lock(this->kf_mtx_);
     return this->kf_poses_odom_.size() - 1;
 }
 
@@ -166,6 +170,7 @@ int PoseGraphManager::currentKFIndex() const
  */
 int PoseGraphManager::graphSize() const
 {
+    std::lock_guard<std::mutex> lock(this->kf_mtx_);
     return this->kf_poses_odom_.size();
 }
 
@@ -197,6 +202,20 @@ std::vector<double> PoseGraphManager::getKFTimestamps() const
 }
 
 /**
+ * @brief Returns a keyframe's point cloud at the given index.
+ * @param index The keyframe index.
+ * @return The point cloud at the given index, or nullptr if out of bounds.
+ */
+pcl::PointCloud<PointType>::Ptr PoseGraphManager::getKeyframePointCloud(int index) const
+{
+    std::lock_guard<std::mutex> lock(this->kf_mtx_);
+    if (index < 0 || index >= static_cast<int>(this->kf_pointclouds.size())) {
+        return nullptr;
+    }
+    return this->kf_pointclouds.at(index);
+}
+
+/**
  * @brief Triggers extra optimization on the pose graph at next optimization
  */
 void PoseGraphManager::triggerExtraOptimization()
@@ -225,11 +244,11 @@ void PoseGraphManager::setLoopClosureManager(std::shared_ptr<LoopClosureManager>
 }
 
 /**
- * @brief Adds a prior factor to the pose graph.
- * 
+ * @brief Adds a prior factor to the pose graph at a specified keyframe index.
  * @param T The transformation matrix representing the prior pose.
+ * @param kf_id The keyframe index for the prior factor. If -1, uses current graph size.
  */
-void PoseGraphManager::addPriorFactorandEstimate(const Eigen::Isometry3d &T)
+void PoseGraphManager::addPriorFactorandEstimate(const Eigen::Isometry3d &T, int kf_id)
 {
     gtsam::Pose3 pose(T.matrix());
 
@@ -241,8 +260,12 @@ void PoseGraphManager::addPriorFactorandEstimate(const Eigen::Isometry3d &T)
         this->params->graph.prior_noise_lin,
         this->params->graph.prior_noise_lin,
         this->params->graph.prior_noise_lin).finished()); // rad, meter
-    
-    const int kf_id = 0; // Initial pose
+
+    // If kf_id is -1, use index 0 for backward compatibility
+    if (kf_id < 0) {
+        kf_id = 0;
+    }
+
     {
         std::lock_guard<std::mutex> lock(this->graph_mtx_);
         this->graph.add(gtsam::PriorFactor<gtsam::Pose3>(kf_id, pose, noise));
@@ -250,6 +273,8 @@ void PoseGraphManager::addPriorFactorandEstimate(const Eigen::Isometry3d &T)
         // Add keyframe estimate
         this->kf_isam_estimates_.insert(kf_id, gtsam::Pose3(T.matrix()));
     }
+
+    ROS_INFO("Added prior factor at keyframe %d", kf_id);
 }
 
 /**
@@ -345,16 +370,11 @@ double PoseGraphManager::distanceTravelledGNSS_() const
  */
 void PoseGraphManager::addGNSSFactor(int kf_index, nav_msgs::Odometry::ConstPtr gnss_odom)
 {
-    // Declare static variable
-    static nav_msgs::Odometry::ConstPtr last_gps = nullptr;
-
     // Break out pose
     auto gnss_pose = gnss_odom->pose;
 
     // If covariance is too high, exit
     if(gnss_pose.covariance[0] > this->params->graph.gps_noise_threshold || gnss_pose.covariance[7] > this->params->graph.gps_noise_threshold) return;
-
-    last_gps = gnss_odom;
 
     // Check if orientation is provided (non-zero orientation covariance indicates orientation is set)
     bool has_orientation = (gnss_pose.covariance[35] > 0);  // Check yaw variance
@@ -496,57 +516,89 @@ void PoseGraphManager::addLoopClosureFactor(int kf_prev, int kf_curr, Eigen::Iso
  */
 void PoseGraphManager::processData(DataPoint data)
 {
-    static Eigen::Isometry3d T_odom_prev;
+
     // Note, need to change the frames to be in the same frame as the flight controller.
     // These transforms have been checked!!
     const auto& T_body_lidar = this->params->extrinsics.T_body_lidar;
     auto T_odom = data.T_odom * T_body_lidar.inverse();
     auto pointcloud = geometry::pclTransform(data.pointcloud, T_body_lidar.matrix());
+    
+    bool is_first_session = !this->graphInitialized();
 
-    // If it's the first time this is run, set the "first" pose.
-    if(! this->graphInitialized()){
-        // We need to try initialize the graph.
-        // We can only do this if: the calibration buffer is full, and
-        // the current pose has a GPS pose.
-        if(this->params->useGNSS() && !data.gnss_msg.has_value() ){
-            ROS_WARN_THROTTLE(5, "Waiting for a GNSS sample before initializing graph.");
+    // Handle session initialization (either first session or after reinitializeSession())
+    if (!this->graphInitialized() || this->awaiting_session_init_) {
+
+        // For multi-drone (non-first session), warn if GNSS/orientation disabled
+        if (!is_first_session && (!this->params->useGNSS() || !this->params->useExternalOrientation())) {
+            ROS_WARN_ONCE("Multi-drone mode without GNSS and external orientation enabled will likely produce poor results. "
+                          "The new drone session will start at identity pose.");
+        }
+
+        // Wait for GPS data to initialize (if GNSS is enabled)
+        if (this->params->useGNSS() && !data.gnss_msg.has_value()) {
+            ROS_WARN_THROTTLE(5, "Waiting for a GNSS sample before initializing session.");
             return;
         }
 
-        // Check orientation requirement (only if external orientation is enabled)
-        if(this->params->useExternalOrientation() && !data.orientation_msg.has_value()){
-            ROS_WARN_THROTTLE(5, "Waiting for orientation message before initializing graph.");
+        // Wait for orientation (if external orientation is enabled)
+        if (this->params->useExternalOrientation() && !data.orientation_msg.has_value()) {
+            ROS_WARN_THROTTLE(5, "Waiting for orientation message before initializing session.");
             return;
         }
 
         // Get first odometry pose (use this to convert to relative measurements later)
-        T_odom_prev = T_odom;
+        this->T_odom_prev_ = T_odom;
 
-        // Make the "first pose" from the orientation and position
-        this->T0_ = Eigen::Isometry3d::Identity();
-        if(this->params->useExternalOrientation() && data.orientation_msg.has_value()){
-            this->T0_.linear() = data.orientation_msg.value().toRotationMatrix();
-            ROS_INFO("Using external orientation for initial pose.");
-        }
-        // Otherwise, use identity orientation
-        
-        // Add keyframe to queue
-        this->addKeyframe(this->T0_, pointcloud, data.timestamp_lio);
+        // Build the session start pose
+        Eigen::Isometry3d T_session_start = Eigen::Isometry3d::Identity();
 
-        // Add prior factor
-        this->addPriorFactorandEstimate(this->T0_);
-
-        // Add GNSS and reset origin (only if GNSS is enabled)
-        if (this->params->useGNSS() && data.gnss_msg.has_value()) {
-            this->navSatFixToOdometry(data.gnss_msg.value(), data.orientation_msg, true);
+        // Set orientation from external source if available
+        if (this->params->useExternalOrientation() && data.orientation_msg.has_value()) {
+            T_session_start.linear() = data.orientation_msg.value().toRotationMatrix();
+            ROS_INFO("Using external orientation for session start pose.");
         }
 
-        ROS_INFO("Initialized graph with prior factor: %s", isometryToStr(this->T0_).c_str());
+        if (is_first_session) {
+            // First session: start at origin, reset GNSS datum
+            this->T0_ = T_session_start;
+
+            if (this->params->useGNSS() && data.gnss_msg.has_value()) {
+                // Reset GNSS origin so first keyframe is at (0,0,0)
+                this->navSatFixToOdometry(data.gnss_msg.value(), data.orientation_msg, true);
+            }
+        } else {
+            // Subsequent session: get position from GNSS in the existing coordinate frame
+            if (this->params->useGNSS() && data.gnss_msg.has_value()) {
+                // Convert GNSS to local coordinates (using existing origin, NOT resetting)
+                auto gnss_odom = this->navSatFixToOdometry(data.gnss_msg.value(), data.orientation_msg, false);
+                T_session_start.translation() = Eigen::Vector3d(
+                    gnss_odom->pose.pose.position.x,
+                    gnss_odom->pose.pose.position.y,
+                    gnss_odom->pose.pose.position.z
+                );
+                ROS_INFO("Using GNSS position for session start: x=%.2f, y=%.2f, z=%.2f",
+                         T_session_start.translation().x(),
+                         T_session_start.translation().y(),
+                         T_session_start.translation().z());
+            }
+        }
+
+        // Add keyframe (index determined by current kf_poses_odom_ size)
+        int new_kf_index = this->addKeyframe(T_session_start, pointcloud, data.timestamp_lio);
+
+        // Add prior factor at the new keyframe index
+        this->addPriorFactorandEstimate(T_session_start, new_kf_index);
+
+        // Clear awaiting flag
+        this->awaiting_session_init_ = false;
+
+        ROS_INFO("Initialized session (drone %d) at keyframe %d: %s",
+                 this->current_drone_id_, new_kf_index, isometryToStr(T_session_start).c_str());
         return;
     }
 
     // Compute current pose
-    Eigen::Isometry3d T_delta = T_odom_prev.inverse() * T_odom;
+    Eigen::Isometry3d T_delta = this->T_odom_prev_.inverse() * T_odom;
 
     // Compute the "estimated" pose from LIO
     // Warning: May be a problem setting current pose so far from the addKeyframe part. Fix?
@@ -556,7 +608,7 @@ void PoseGraphManager::processData(DataPoint data)
 
     // Early reject by counting local delta movement (for equi-spreated kf drop)
     // Compute distance travelled since previous odometry keyframe
-    auto [linear_distance, angular_distance] = geometry::poseDistance(T_odom_prev, T_odom);
+    auto [linear_distance, angular_distance] = geometry::poseDistance(this->T_odom_prev_, T_odom);
 
     // Break out of loop if distance travelled is insufficient. Otherwise, reset accumulated travel.
     if( linear_distance < this->params->graph.kf_gap_lin && angular_distance < this->params->graph.kf_gap_rot ){
@@ -577,7 +629,7 @@ void PoseGraphManager::processData(DataPoint data)
     int current_kf_index = this->addKeyframe(T_kf, pointcloud, data.timestamp_lio);
 
     // Reset previous odometry variable
-    T_odom_prev = T_odom;
+    this->T_odom_prev_ = T_odom;
     
     // Get odometry poses and noise
     this->addOdometryFactorAndEstimate(current_kf_index, T_delta, T_kf_updated);
@@ -666,7 +718,7 @@ void PoseGraphManager::saveGraphKeyframes() const
     if(!this->graphInitialized()) return;
 
     std::string filename_kf = this->params->ros.save_directory + "optimized_poses.txt";
-    saveTransformsKITTI(this->getUpdatedKFPoses(), filename_kf);
+    saveTransformsToFile(this->getUpdatedKFPoses(), this->kf_drone_ids_, filename_kf);
 
     if(!this->gnss_origin_) return;
 
@@ -677,16 +729,19 @@ void PoseGraphManager::saveGraphKeyframes() const
 
 /**
  * @brief Assemble a global pointcloud using the updated pose estimates
- * 
+ *
  * @param frame_skip will skip keyframes to reduce computational intensity
  */
 pcl::PointCloud<PointType>::Ptr PoseGraphManager::assembleGlobalPointCloud(int frame_skip) const {
-    
+
     pcl::PointCloud<PointType>::Ptr globalCloud(new pcl::PointCloud<PointType>());
     auto updatedPoses = this->getUpdatedKFPoses();
 
     for (size_t i = 0; i < updatedPoses.size(); i += frame_skip) {
-        *globalCloud += *geometry::pclTransform(this->kf_pointclouds.at(i), updatedPoses.at(i).matrix());
+        auto pointcloud = this->getKeyframePointCloud(i);
+        if (pointcloud) {
+            *globalCloud += *geometry::pclTransform(pointcloud, updatedPoses.at(i).matrix());
+        }
     }
 
     return globalCloud;
@@ -762,4 +817,81 @@ nav_msgs::Odometry::ConstPtr PoseGraphManager::navSatFixToOdometry(
 
     nav_msgs::Odometry::Ptr odom_ptr = boost::make_shared<nav_msgs::Odometry>(odom);
     return nav_msgs::Odometry::ConstPtr(odom_ptr);
+}
+
+/**
+ * @brief Re-initializes the PGO session for a new drone in a multi-drone swarm.
+ *
+ * Increments the drone ID, records the session boundary, clears the data buffer,
+ * and sets the flag to await session initialization on the next processData call.
+ * The ScanContext database is preserved to enable inter-drone loop closures.
+ *
+ * @return The next keyframe index that will be used for the new session.
+ */
+int PoseGraphManager::reinitializeSession()
+{
+    this->current_drone_id_++;
+
+    int next_kf_index = this->kf_poses_odom_.size();
+    this->session_start_indices_.push_back(next_kf_index);
+    this->session_drone_ids_.push_back(this->current_drone_id_);
+
+    this->data_buffer.clearAll();
+
+    // Clear the inter-keyframe buffer
+    while (!this->inter_kf_pointcloud_buffer_.empty()) {
+        this->inter_kf_pointcloud_buffer_.pop();
+    }
+
+    // Reset odometry tracking for new session
+    this->T_odom_prev_ = Eigen::Isometry3d::Identity();
+
+    this->awaiting_session_init_ = true;
+
+    ROS_INFO("Re-initialized session for drone %d. Next keyframe index: %d",
+             this->current_drone_id_, next_kf_index);
+
+    return next_kf_index;
+}
+
+/**
+ * @brief Returns the current drone ID for the active session.
+ */
+uint8_t PoseGraphManager::getCurrentDroneId() const
+{
+    return this->current_drone_id_;
+}
+
+/**
+ * @brief Returns the drone ID associated with each keyframe.
+ */
+std::vector<uint8_t> PoseGraphManager::getKeyframeDroneIds() const
+{
+    std::lock_guard<std::mutex> lock(this->kf_mtx_);
+    return this->kf_drone_ids_;
+}
+
+/**
+ * @brief Returns session boundary information as pairs of (start_index, drone_id).
+ */
+std::vector<std::pair<int, uint8_t>> PoseGraphManager::getSessionBoundaries() const
+{
+    std::vector<std::pair<int, uint8_t>> boundaries;
+
+    // First session always starts at index 0 with drone_id 0
+    boundaries.push_back({0, 0});
+
+    for (size_t i = 0; i < this->session_start_indices_.size(); ++i) {
+        boundaries.push_back({this->session_start_indices_[i], this->session_drone_ids_[i]});
+    }
+
+    return boundaries;
+}
+
+/**
+ * @brief Returns whether GNSS has been initialized.
+ */
+bool PoseGraphManager::isGNSSInitialized() const
+{
+    return this->gnss_initialized_;
 }

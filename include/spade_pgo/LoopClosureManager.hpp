@@ -34,6 +34,8 @@ public:
     std::optional<std::pair<Eigen::Isometry3d, double>> icp( int kf_prev, int kf_curr );
 
     std::vector<std::pair<int, int>> getAddedLoopClosures() const;
+    size_t getCandidateQueueSize() const;
+    size_t getTestedCandidatesCount() const;
 
     SCManager sc_detector;
     NearKFDetector near_kf_detector;

@@ -32,6 +32,10 @@
 #include <visualization_msgs/Marker.h>
 #include <visualization_msgs/MarkerArray.h>
 
+// Multi-drone swarm service and state message
+#include "spade_pgo/ReinitSession.h"
+#include "spade_pgo/PGOState.h"
+
 #include <Eigen/Dense>
 #include <Eigen/Geometry>
 
@@ -42,10 +46,11 @@ using namespace spade_pgo;
 std::shared_ptr<PoseGraphManager> graph_manager;
 std::shared_ptr<Visualizer> visualizer;
 std::shared_ptr<LoopClosureManager> loop_closure_manager;
+ros::Publisher state_publisher;
 
 void process_pg()
 {
-    while(1)
+    while(ros::ok())
     {
         // While odometry buffer and laser scan buffer (full res) are not empty.
 		while ( graph_manager->data_buffer.dataAvailable() )
@@ -78,7 +83,7 @@ void process_lcd(void)
 // Compute exact graph factors from identified loop closure frames
 void process_icp(void)
 {
-    while(1)
+    while(ros::ok())
     {
 		loop_closure_manager->processCandidateQueue();
 
@@ -122,6 +127,67 @@ void process_viz_map(void)
     }
 } // pointcloud_viz
 
+// Service callback for reinitializing the PGO session for a new drone
+bool reinitSessionCallback(
+    spade_pgo::ReinitSession::Request& req,
+    spade_pgo::ReinitSession::Response& res)
+{
+    (void)req;
+
+    int next_kf_index = graph_manager->reinitializeSession();
+
+    res.success = true;
+    res.message = "Session reinitialized successfully";
+    res.drone_id = graph_manager->getCurrentDroneId();
+    res.next_keyframe_index = next_kf_index;
+
+    ROS_INFO("ReinitSession service called. New drone_id: %d, next_keyframe_index: %d",
+             res.drone_id, res.next_keyframe_index);
+
+    return true;
+}
+
+// Publish PGO state at a given frequency
+void process_state_publisher(void)
+{
+    float hz = 2.0;
+    ros::Rate rate(hz);
+
+    // Track session start index for current session
+    int session_start_index = 0;
+
+    while (ros::ok()) {
+        rate.sleep();
+
+        spade_pgo::PGOState state_msg;
+        state_msg.header.stamp = ros::Time::now();
+        state_msg.header.frame_id = "map";
+
+        state_msg.current_drone_id = graph_manager->getCurrentDroneId();
+        state_msg.num_keyframes = graph_manager->graphSize();
+        state_msg.graph_initialized = graph_manager->graphInitialized();
+        state_msg.gnss_initialized = graph_manager->isGNSSInitialized();
+
+        state_msg.lc_candidate_queue_size = loop_closure_manager->getCandidateQueueSize();
+        state_msg.lc_tested_count = loop_closure_manager->getTestedCandidatesCount();
+        state_msg.lc_added_count = loop_closure_manager->getAddedLoopClosures().size();
+
+        // Get session boundaries
+        auto boundaries = graph_manager->getSessionBoundaries();
+        for (const auto& boundary : boundaries) {
+            state_msg.session_start_indices.push_back(boundary.first);
+            state_msg.session_drone_ids.push_back(boundary.second);
+        }
+
+        // Calculate keyframes in current session
+        if (!boundaries.empty()) {
+            session_start_index = boundaries.back().first;
+        }
+        state_msg.num_keyframes_current_session = state_msg.num_keyframes - session_start_index;
+
+        state_publisher.publish(state_msg);
+    }
+}
 
 int main(int argc, char **argv)
 {
@@ -213,6 +279,11 @@ int main(int argc, char **argv)
     visualizer->setLoopClosureManager(loop_closure_manager);
     graph_manager->setLoopClosureManager(loop_closure_manager);
 
+    // Multi-drone swarm service and state publisher
+    ros::ServiceServer reinit_service = nh.advertiseService("/spade_pgo/reinit_session", reinitSessionCallback);
+    state_publisher = nh.advertise<spade_pgo::PGOState>("/spade_pgo/state", 10);
+    ROS_INFO("Multi-drone swarm support enabled. Service: /spade_pgo/reinit_session, State: /spade_pgo/state");
+
     // Point cloud subscriber
     ros::Subscriber subscriber_pointcloud = nh.subscribe<sensor_msgs::PointCloud2>(
         params->ros.pointcloud_topic, 100, 
@@ -271,13 +342,23 @@ int main(int argc, char **argv)
 
 
 	std::thread posegraph_slam {process_pg}; // pose graph construction
-	std::thread lc_detection {process_lcd}; // loop closure detection 
-	std::thread icp_calculation {process_icp}; // loop constraint calculation via icp 
-	std::thread isam_update {process_isam}; // if you want to call less isam2 run (for saving redundant computations and no real-time visulization is required), uncommment this and comment all the above runisam2opt when node is added. 
+	std::thread lc_detection {process_lcd}; // loop closure detection
+	std::thread icp_calculation {process_icp}; // loop constraint calculation via icp
+	std::thread isam_update {process_isam}; // if you want to call less isam2 run (for saving redundant computations and no real-time visulization is required), uncommment this and comment all the above runisam2opt when node is added.
 	std::thread viz_map {process_viz_map}; // visualization - map (low frequency because it is heavy)
 	std::thread viz_path {process_viz_path}; // visualization - path (high frequency)
+	std::thread state_pub {process_state_publisher}; // multi-drone state publisher
 
  	ros::spin();
+
+	// Clean shutdown: wait for all threads to finish
+	posegraph_slam.join();
+	lc_detection.join();
+	icp_calculation.join();
+	isam_update.join();
+	viz_map.join();
+	viz_path.join();
+	state_pub.join();
 
 	return 0;
 }

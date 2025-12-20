@@ -42,7 +42,8 @@ public:
     void pushOrientation(const geometry_msgs::Quaternion::ConstPtr& quat);    
 
     std::optional<DataPoint> popDataPoint();
-    bool dataAvailable();
+    bool dataAvailable(bool lock_mutex = true);
+    void clearAll();
 
     double gnssAllowedTimeDelta;
 
@@ -51,7 +52,7 @@ private:
     std::queue<sensor_msgs::PointCloud2ConstPtr> cloud_buffer_;
     std::queue<sensor_msgs::NavSatFix::ConstPtr> gnss_buffer_;
     std::queue<Eigen::Quaterniond> orientation_buffer_;
-    std::mutex buffer_mutex_;
+    mutable std::mutex buffer_mutex_;
     
     /// Helper function to convert a nav_msgs::Odometry message into an Eigen::Isometry3d.
     Eigen::Isometry3d odomMsgToIsometry(const nav_msgs::Odometry &odom);

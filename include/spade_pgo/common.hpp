@@ -67,15 +67,25 @@ inline std::string padZeros(int val, int num_digits = 6) {
 	return out.str();
 }
 
-inline void saveTransformsKITTI(std::vector<Eigen::Isometry3d> transforms, std::string filename)
+inline void saveTransformsToFile(
+    const std::vector<Eigen::Isometry3d>& transforms,
+    const std::vector<uint8_t>& drone_ids,
+    const std::string& filename)
 {
-	std::fstream stream(filename.c_str(), std::fstream::out);
-	for(const auto& Ti: transforms) {
-		stream << Ti(0,0) << " " << Ti(0,1) << " " << Ti(0,2) << " " << Ti(0,3) << " "
-					 << Ti(1,0) << " " << Ti(1,1) << " " << Ti(1,2) << " " << Ti(1,3) << " "
-					 << Ti(2,0) << " " << Ti(2,1) << " " << Ti(2,2) << " " << Ti(2,3) << std::endl;
-	}
+    std::fstream stream(filename.c_str(), std::fstream::out);
 
+    // Header
+    stream << "# keyframe_id drone_id r00 r01 r02 t0 r10 r11 r12 t1 r20 r21 r22 t2" << std::endl;
+
+    for (size_t i = 0; i < transforms.size(); ++i) {
+        const auto& Ti = transforms[i];
+        uint8_t drone_id = (i < drone_ids.size()) ? drone_ids[i] : 0;
+
+        stream << i << " " << static_cast<int>(drone_id) << " "
+               << Ti(0,0) << " " << Ti(0,1) << " " << Ti(0,2) << " " << Ti(0,3) << " "
+               << Ti(1,0) << " " << Ti(1,1) << " " << Ti(1,2) << " " << Ti(1,3) << " "
+               << Ti(2,0) << " " << Ti(2,1) << " " << Ti(2,2) << " " << Ti(2,3) << std::endl;
+    }
 }
 
-}
+} // namespace spade_pgo

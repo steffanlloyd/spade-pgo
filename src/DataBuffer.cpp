@@ -69,7 +69,7 @@ void DataBuffer::pushGNSS(const sensor_msgs::NavSatFix::ConstPtr &gps)
  */
 void DataBuffer::pushOrientation(const nav_msgs::Odometry::ConstPtr& odom)
 {
-    std::lock_guard<std::mutex> lock(buffer_mutex_);
+    std::lock_guard<std::mutex> lock(this->buffer_mutex_);
     Eigen::Quaterniond q(
         odom->pose.pose.orientation.w,
         odom->pose.pose.orientation.x,
@@ -87,7 +87,7 @@ void DataBuffer::pushOrientation(const nav_msgs::Odometry::ConstPtr& odom)
  */
 void DataBuffer::pushOrientation(const geometry_msgs::Quaternion::ConstPtr& quat)
 {
-    std::lock_guard<std::mutex> lock(buffer_mutex_);
+    std::lock_guard<std::mutex> lock(this->buffer_mutex_);
     Eigen::Quaterniond q(quat->w, quat->x, quat->y, quat->z);
     this->orientation_buffer_.push(q.normalized());
 }
@@ -111,14 +111,14 @@ std::optional<DataPoint> DataBuffer::popDataPoint()
     std::lock_guard<std::mutex> lock(this->buffer_mutex_);
         
     // Synchronize buffers: discard odometry messages older than the cloud.
-    while (this->dataAvailable() &&
+    while (this->dataAvailable(false) &&
            this->odom_buffer_.front()->header.stamp.toSec() < this->cloud_buffer_.front()->header.stamp.toSec())
     {
         this->odom_buffer_.pop();
     }
-    
+
     // After synchronization, verify buffers are still non-empty.
-    if (! this->dataAvailable()) return std::nullopt;
+    if (!this->dataAvailable(false)) return std::nullopt;
 
     DataPoint data;
     
@@ -158,11 +158,34 @@ std::optional<DataPoint> DataBuffer::popDataPoint()
 }
 
 /**
- * Checks whether there is data in the buffers
+ * @brief Checks whether there is data in the buffers.
+ * @param lock_mutex If true (default), acquires the buffer mutex. Pass false when
+ *                   calling from a context that already holds the lock.
  */
-bool DataBuffer::dataAvailable()
+bool DataBuffer::dataAvailable(bool lock_mutex)
 {
+    if (lock_mutex) {
+        std::lock_guard<std::mutex> lock(this->buffer_mutex_);
+        return !this->odom_buffer_.empty() && !this->cloud_buffer_.empty();
+    }
     return !this->odom_buffer_.empty() && !this->cloud_buffer_.empty();
+}
+
+/**
+ * @brief Clears all data buffers for session re-initialization.
+ * Thread-safe method that empties odom, cloud, gnss, and orientation buffers.
+ */
+void DataBuffer::clearAll()
+{
+    std::lock_guard<std::mutex> lock(this->buffer_mutex_);
+
+    // Clear all queues by swapping with empty queues (efficient and exception-safe)
+    std::queue<nav_msgs::Odometry::ConstPtr>().swap(this->odom_buffer_);
+    std::queue<sensor_msgs::PointCloud2ConstPtr>().swap(this->cloud_buffer_);
+    std::queue<sensor_msgs::NavSatFix::ConstPtr>().swap(this->gnss_buffer_);
+    std::queue<Eigen::Quaterniond>().swap(this->orientation_buffer_);
+
+    ROS_INFO("DataBuffer: All buffers cleared for session re-initialization");
 }
 
 

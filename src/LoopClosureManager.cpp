@@ -37,6 +37,8 @@ LoopClosureManager::~LoopClosureManager() {}
  */
 void LoopClosureManager::submitCandidate(int id1, int id2)
 {
+    std::lock_guard<std::mutex> lock(this->candidate_mutex_);
+
     // Check if pair already tested.
     for (const auto& p : this->tested_candidates_) {
         if ((p.first == id1 && p.second == id2) ||
@@ -45,12 +47,8 @@ void LoopClosureManager::submitCandidate(int id1, int id2)
             return;
         }
     }
-    // Add candidate in a thread-safe manner.
-    {
-        std::lock_guard<std::mutex> lock(this->candidate_mutex_);
-        this->candidate_queue_.emplace(id1, id2);
-    }
-    // Add to list of tested candidates
+    // Add candidate to queue and tested list
+    this->candidate_queue_.emplace(id1, id2);
     this->tested_candidates_.emplace_back(id1, id2);
 }
 
@@ -71,55 +69,66 @@ void LoopClosureManager::updateCandidateQueue()
         this->graph_manager_->graphSize() > this->sc_detector.NUM_EXCLUDE_RECENT)
     {
         auto sc_candidate = this->sc_detector.detectLoopClosureID();
-        if (sc_candidate.first != -1)
+        if (sc_candidate.first != -1) {
             ROS_INFO("Added SC loop closure candidate between %d and %d", sc_candidate.first, this->graph_manager_->currentKFIndex());
             this->submitCandidate(sc_candidate.first, this->graph_manager_->currentKFIndex());
+        }
     }
 }
 
 void LoopClosureManager::processCandidateQueue()
 {
-    bool queue_not_empty = !this->candidate_queue_.empty();
-    while ( !this->candidate_queue_.empty() )
+    bool queue_was_not_empty = this->getCandidateQueueSize() > 0;
+
+    while (this->getCandidateQueueSize() > 0)
     {
-        if( this->candidate_queue_.size() > 200 ) {
-            ROS_WARN_THROTTLE(2, "%ld loop closure candidates waiting... Adjust settings to produce fewer loop closure candidates", this->candidate_queue_.size());
+        size_t queue_size = this->getCandidateQueueSize();
+        if (queue_size > 200) {
+            ROS_WARN_THROTTLE(2, "%ld loop closure candidates waiting... Adjust settings to produce fewer loop closure candidates", queue_size);
         }
 
         // Pop the queue with a mutex for safety
         std::pair<int, int> candidate_pair;
         {
             std::lock_guard<std::mutex> lock(this->candidate_mutex_);
+
+            if (this->candidate_queue_.empty()) {
+                break;
+            }
+
             candidate_pair = this->candidate_queue_.front();
-            
+
             // We can't process loop closures until the pose has been updated by the graph.
             // Skip any that are not updated.
             if(candidate_pair.first >= this->graph_manager_->updatedKFIndex() || candidate_pair.second >= this->graph_manager_->updatedKFIndex()){
                 break;
             }
-            
+
             this->candidate_queue_.pop();
         }
 
         // get BetweenFactor between poses (or std::nullopt if doesn't pass test)
         const int kf_prev = candidate_pair.first;
         const int kf_curr = candidate_pair.second;
-        
-        // Do ICP, add graph factor if valid
+
+        // Do ICP, add graph factor if valid (ICP is expensive, do outside mutex)
         if(auto relative_pose = this->icp(kf_prev, kf_curr)) {
             auto [Ticp, fitness_score] = relative_pose.value();
 
             // Add to list of loop closures to add to graph
             this->graph_manager_->addLoopClosureFactor(kf_prev, kf_curr, Ticp, fitness_score);
 
-            // Add to list of added loop closures
-            this->added_loop_closures_.emplace_back(kf_prev, kf_curr);
-        } 
+            // Add to list of added loop closures (thread-safe)
+            {
+                std::lock_guard<std::mutex> lock(this->candidate_mutex_);
+                this->added_loop_closures_.emplace_back(kf_prev, kf_curr);
+            }
+        }
 
-        ROS_INFO("Loop closure queue size: %ld", this->candidate_queue_.size());
-
+        ROS_INFO("Loop closure queue size: %ld", this->getCandidateQueueSize());
     }
-    if (queue_not_empty && this->candidate_queue_.empty()) {
+
+    if (queue_was_not_empty && this->getCandidateQueueSize() == 0) {
         ROS_INFO("Finished processing loop closure candidates");
     }
 }
@@ -188,6 +197,24 @@ std::vector<std::pair<int, int>> LoopClosureManager::getAddedLoopClosures() cons
 }
 
 /**
+ * @brief Returns the current size of the loop closure candidate queue.
+ */
+size_t LoopClosureManager::getCandidateQueueSize() const
+{
+    std::lock_guard<std::mutex> lock(this->candidate_mutex_);
+    return this->candidate_queue_.size();
+}
+
+/**
+ * @brief Returns the number of tested loop closure candidates.
+ */
+size_t LoopClosureManager::getTestedCandidatesCount() const
+{
+    std::lock_guard<std::mutex> lock(this->candidate_mutex_);
+    return this->tested_candidates_.size();
+}
+
+/**
  * @brief Assembles nearby keyframes cloud for loop closure detection.
  * @param[in] cloud The point cloud to be assembled.
  * @param kf_index The index of the keyframe.
@@ -203,7 +230,10 @@ void LoopClosureManager::assembleNearbyKeyframesCloud_(
     auto kf_updated = this->graph_manager_->getUpdatedKFPoses();
     for (int i = kf_index-num_kf_accumulate; i <= kf_index+num_kf_accumulate; ++i) {
         if (i < 0 || i >= static_cast<int>(kf_updated.size())) continue;
-        *cloud_in += *geometry::pclTransform(this->graph_manager_->kf_pointclouds.at(i), kf_updated.at(i).matrix());
+        auto pointcloud = this->graph_manager_->getKeyframePointCloud(i);
+        if (pointcloud) {
+            *cloud_in += *geometry::pclTransform(pointcloud, kf_updated.at(i).matrix());
+        }
     }
 
 } // assembleNearbyKeyframesCloud_
