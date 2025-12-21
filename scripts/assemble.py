@@ -19,6 +19,7 @@ ARGUMENTS
     -e, --end-frame N       End keyframe index (inclusive)
     -ir, --ignore-range STR Ignore keyframe ranges, e.g., '100-150' or '50-60,100-150'
     -es, --exclude-start N       Exclude first N keyframes from each drone session (default: 0)
+    -ee, --exclude-end N         Exclude last N keyframes from each drone session (default: 0)
 
 EXAMPLES
 --------
@@ -152,6 +153,8 @@ def main():
                         help="Ignore keyframe ranges, e.g., '100-150' or '50-60,100-150'")
     parser.add_argument("-es", "--exclude-start", type=int, default=0,
                         help="Exclude first N keyframes from each drone session (default: 0)")
+    parser.add_argument("-ee", "--exclude-end", type=int, default=0,
+                        help="Exclude last N keyframes from each drone session (default: 0)")
     args = parser.parse_args()
 
     # Setup paths
@@ -197,13 +200,25 @@ def main():
     # Add implicit first session start
     all_session_starts = [0] + session_starts
 
-    # Build set of keyframes to exclude (first N from each session)
+    # Determine session end keyframes (last keyframe before next session, or max keyframe for final session)
+    max_kf = max(poses.keys()) if poses else 0
+    session_ends = [s - 1 for s in session_starts] + [max_kf]
+
+    # Build set of keyframes to exclude (first/last N from each session)
     exclude_set = set()
     if args.exclude_start > 0:
         for session_start in all_session_starts:
             for i in range(args.exclude_start):
                 exclude_set.add(session_start + i)
         print(f"Excluding first {args.exclude_start} keyframes from each of {len(all_session_starts)} sessions")
+
+    if args.exclude_end > 0:
+        for session_end in session_ends:
+            for i in range(args.exclude_end):
+                exclude_set.add(session_end - i)
+        print(f"Excluding last {args.exclude_end} keyframes from each of {len(session_ends)} sessions")
+
+    if exclude_set:
         print(f"Excluded keyframes: {sorted(exclude_set)}")
 
     # Apply filters

@@ -469,7 +469,7 @@ class MultiswarmOrchestrator:
         self.stop_pgo_node()
         self.stop_roscore()
 
-        log_info(f"\n{'='*60}")
+        log_info(f"{'='*60}")
         if success_count == len(bags):
             log_success(f"Processing complete: {success_count}/{len(bags)} sessions successful")
         else:
@@ -523,7 +523,7 @@ NOTES:
     parser.add_argument(
         "--bag-rate",
         type=float,
-        default=3,
+        default=4,
         help="Rosbag playback rate multiplier (default: normal speed)"
     )
     parser.add_argument(

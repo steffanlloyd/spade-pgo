@@ -32,8 +32,8 @@ def parse_args():
 
     p.add_argument("-i", "--input", required=True, help="Input LAS file")
     p.add_argument("-o", "--output", default=None, help="Output LAS file")
-    p.add_argument("-g", "--grid-size", type=float, default=5.0, help="Grid size in meters")
-    p.add_argument("-w", "--kf-window", type=int, default=20, help="Keyframe clustering window")
+    p.add_argument("-g", "--grid-size", type=float, default=10.0, help="Grid size in meters")
+    p.add_argument("-w", "--kf-window", type=int, default=40, help="Keyframe clustering window")
     p.add_argument("-v", "--verbose", action="store_true", help="Verbose output")
 
     return p.parse_args()

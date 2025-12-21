@@ -16,7 +16,11 @@ struct PGOParams{
         int num_kf_accumulate_past;
         int num_kf_accumulate_now;
         double fitness_threshold; // average squared distances between matches
+        double min_inlier_ratio; // minimum ratio of inliers to total correspondences (0 = disabled)
         double max_correspondence_distance; // m
+        int max_iterations; // max ICP iterations
+        double max_height_above_ground; // m, filter points above this height relative to min z (0 = disabled)
+        double max_radius_from_keyframe; // m, filter points beyond this distance from keyframe (0 = disabled)
         bool save_pointclouds;
         bool publish_pointclouds;
     } icp;

@@ -201,9 +201,12 @@ int main(int argc, char **argv)
     nh.param<int>("spade_pgo/icp/num_kf_accumulate_past", params->icp.num_kf_accumulate_past, 5); // Number of keyframes point cloud to be included in the submap for icp alignment (old keyframe)
     nh.param<int>("spade_pgo/icp/num_kf_accumulate_now", params->icp.num_kf_accumulate_now, 2); // Number of keyframes point cloud to be included in the submap for icp alignment (current keyframe)
     nh.param<double>("spade_pgo/icp/fitness_threshold", params->icp.fitness_threshold, 0.3); // ICP's loop fitness score threshold to accept closing a loop (i.e. registration was successful)
-    // average squared distances between matches
+    nh.param<double>("spade_pgo/icp/min_inlier_ratio", params->icp.min_inlier_ratio, 0.1); // Minimum ratio of inliers to total correspondences (0 = disabled)
     nh.param<double>("spade_pgo/icp/voxel_size", params->icp.voxel_size, 0.2); // ICP's downsampling   
     nh.param<double>("spade_pgo/icp/max_correspondence_distance", params->icp.max_correspondence_distance, 2); // Maximum distance before points are ignored
+    nh.param<int>("spade_pgo/icp/max_iterations", params->icp.max_iterations, 50); // Max ICP iterations
+    nh.param<double>("spade_pgo/icp/max_height_above_ground", params->icp.max_height_above_ground, 0); // Filter points above this height relative to min z (0 = disabled)
+    nh.param<double>("spade_pgo/icp/max_radius_from_keyframe", params->icp.max_radius_from_keyframe, 25); // Filter points beyond this distance from keyframe (0 = disabled)
     nh.param<bool>("spade_pgo/icp/save_pointclouds", params->icp.save_pointclouds, false); // Save pointclouds to file (for post-processing)
     nh.param<bool>("spade_pgo/icp/publish_pointclouds", params->icp.publish_pointclouds, false); // Publish point clouds (for debugging)
 

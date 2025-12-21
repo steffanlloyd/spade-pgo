@@ -3,6 +3,7 @@
 #include <mutex>
 #include <optional>
 #include <utility>
+#include <limits>
 
 #include "spade_pgo/LoopClosureManager.hpp"
 #include "spade_pgo/geometry.hpp"
@@ -149,23 +150,36 @@ std::optional<std::pair<Eigen::Isometry3d, double>> LoopClosureManager::icp( int
 
     // Assemble point clouds from frames around potential key frames indicies
     this->assembleNearbyKeyframesCloud_(cloud_curr, kf_curr, this->params_->icp.num_kf_accumulate_now);
-    this->assembleNearbyKeyframesCloud_(cloud_prev, kf_prev, this->params_->icp.num_kf_accumulate_past);   
+    this->assembleNearbyKeyframesCloud_(cloud_prev, kf_prev, this->params_->icp.num_kf_accumulate_past);
+
+    // Preprocess clouds to remove canopy and distant points
+    auto kf_poses = this->graph_manager_->getUpdatedKFPoses();
+    this->preprocessPointCloud_(cloud_curr, kf_poses.at(kf_curr));
+    this->preprocessPointCloud_(cloud_prev, kf_poses.at(kf_prev));
+
+    // Check for insufficient points after preprocessing
+    constexpr size_t MIN_POINTS_FOR_ICP = 100;
+    if (cloud_curr->size() < MIN_POINTS_FOR_ICP || cloud_prev->size() < MIN_POINTS_FOR_ICP) {
+        ROS_WARN("[Loop Closure] Insufficient points for ICP between %d and %d (curr: %zu, prev: %zu). Skipping.",
+                 kf_prev, kf_curr, cloud_curr->size(), cloud_prev->size());
+        return std::nullopt;
+    }
 
     // Publish clouds, if in settings
     this->visualizer_->publishLCClouds(cloud_curr, cloud_prev);
-    
+
     // Get the current time before ICP computation
     ros::Time icp_start_time = ros::Time::now();
     pcl::PointCloud<PointType>::Ptr reg_result(new pcl::PointCloud<PointType>());
 
     // Perform ICP
     auto source = geometry::pclToEigen(cloud_curr);
-    auto target = geometry::pclToEigen(cloud_prev); 
+    auto target = geometry::pclToEigen(cloud_prev);
     small_gicp::RegistrationSetting settings;
-    settings.num_threads = 6;                    // Number of threads to be used
+    settings.num_threads = 12;                    // Number of threads to be used
     settings.max_correspondence_distance = this->params_->icp.max_correspondence_distance;  // Maximum correspondence distance between points (e.g., triming threshold)
     settings.voxel_resolution = 1.0;
-    settings.max_iterations = 50;
+    settings.max_iterations = this->params_->icp.max_iterations;
     settings.downsampling_resolution = this->params_->icp.voxel_size;
 
     if (this->params_->icp.algorithm == "small_gicp") settings.type = small_gicp::RegistrationSetting::RegistrationType::GICP;
@@ -175,14 +189,34 @@ std::optional<std::pair<Eigen::Isometry3d, double>> LoopClosureManager::icp( int
     Isometry3d init_transform = Isometry3d::Identity();
     small_gicp::RegistrationResult result = small_gicp::align(target->points, source->points, init_transform, settings);
 
-    float fitness_score = result.error / result.num_inliers;
     Isometry3d correction_transform = result.T_target_source;
+    double icp_runtime_ms = (ros::Time::now() - icp_start_time).toSec() * 1e3;
+
+    // Guard against division by zero when no inliers found
+    if (result.num_inliers == 0) {
+        ROS_WARN("[Loop Closure] ICP found no inliers between %d and %d. Skipping. ICP runtime: %.3g ms.",
+                 kf_prev, kf_curr, icp_runtime_ms);
+        return std::nullopt;
+    }
+
+    // Check inlier ratio (use smaller cloud as reference for expected correspondences)
+    const size_t min_cloud_size = std::min(source->size(), target->size());
+    const float inlier_ratio = static_cast<float>(result.num_inliers) / static_cast<float>(min_cloud_size);
+    if (this->params_->icp.min_inlier_ratio > 0 && inlier_ratio < this->params_->icp.min_inlier_ratio) {
+        ROS_WARN("[Loop Closure] Low inlier ratio (%.1f%% < %.1f%%). Rejecting loop closure between %d and %d. ICP runtime: %.3g ms.",
+                 inlier_ratio * 100, this->params_->icp.min_inlier_ratio * 100, kf_prev, kf_curr, icp_runtime_ms);
+        return std::nullopt;
+    }
+
+    float fitness_score = result.error / result.num_inliers;
 
     if (!result.converged || std::isnan(fitness_score) || fitness_score > this->params_->icp.fitness_threshold) {
-        ROS_WARN("[Loop Closure] ICP fitness test failed (%.4g > %.4g). Not adding loop closure between %d and %d. ICP runtime: %.3g ms. Distance: %.4g m.", fitness_score, this->params_->icp.fitness_threshold, kf_prev, kf_curr, (ros::Time::now() - icp_start_time).toSec()*1e3, correction_transform.translation().norm());
+        ROS_WARN("[Loop Closure] ICP fitness test failed (%.4g > %.4g). Not adding loop closure between %d and %d. ICP runtime: %.3g ms. Distance: %.4g m. Inliers: %zu.",
+                 fitness_score, this->params_->icp.fitness_threshold, kf_prev, kf_curr, icp_runtime_ms, correction_transform.translation().norm(), result.num_inliers);
         return std::nullopt;
     } else {
-        ROS_INFO("[Loop Closure] ICP fitness test passed (%.4g < %.4g). Adding loop closure between %d and %d. ICP runtime: %.3g ms. Distance: %.4g m.", fitness_score, this->params_->icp.fitness_threshold, kf_prev, kf_curr, (ros::Time::now() - icp_start_time).toSec()*1e3, correction_transform.translation().norm());
+        ROS_INFO("[Loop Closure] ICP fitness test passed (%.4g < %.4g). Adding loop closure between %d and %d. ICP runtime: %.3g ms. Distance: %.4g m. Inliers: %zu.",
+                 fitness_score, this->params_->icp.fitness_threshold, kf_prev, kf_curr, icp_runtime_ms, correction_transform.translation().norm(), result.num_inliers);
     }
 
     return std::make_pair(correction_transform, fitness_score);
@@ -239,5 +273,67 @@ void LoopClosureManager::assembleNearbyKeyframesCloud_(
     }
 
 } // assembleNearbyKeyframesCloud_
+
+/**
+ * @brief Preprocesses a point cloud by filtering out high-altitude and distant points.
+ *
+ * For forest environments, the canopy makes ICP matching difficult. This function
+ * removes points that are above a configurable height threshold relative to the
+ * 2nd percentile z value (robust ground estimate), and points beyond a maximum
+ * horizontal distance from the keyframe origin.
+ *
+ * @param cloud The point cloud to preprocess (modified in place).
+ * @param T_origin The pose of the keyframe used as the origin for distance filtering.
+ */
+void LoopClosureManager::preprocessPointCloud_(pcl::PointCloud<PointType>::Ptr& cloud, const Eigen::Isometry3d& T_origin) const
+{
+    if (cloud->empty()) {
+        return;
+    }
+
+    const bool filter_height = this->params_->icp.max_height_above_ground > 0;
+    const bool filter_radius = this->params_->icp.max_radius_from_keyframe > 0;
+
+    if (!filter_height && !filter_radius) {
+        return;
+    }
+
+    // Calculate ground z using 2nd percentile (robust to outliers)
+    float ground_z = 0.0f;
+    if (filter_height) {
+        std::vector<float> z_values;
+        z_values.reserve(cloud->size());
+        for (const auto& point : cloud->points) {
+            z_values.push_back(point.z);
+        }
+        const size_t percentile_idx = static_cast<size_t>(z_values.size() * 0.02);
+        std::nth_element(z_values.begin(), z_values.begin() + percentile_idx, z_values.end());
+        ground_z = z_values[percentile_idx];
+    }
+
+    const float max_z = ground_z + static_cast<float>(this->params_->icp.max_height_above_ground);
+    const float max_radius_sq = static_cast<float>(this->params_->icp.max_radius_from_keyframe *
+                                                    this->params_->icp.max_radius_from_keyframe);
+    const Eigen::Vector3f origin = T_origin.translation().cast<float>();
+
+    pcl::PointCloud<PointType>::Ptr filtered_cloud(new pcl::PointCloud<PointType>());
+    filtered_cloud->reserve(cloud->size());
+
+    for (const auto& point : cloud->points) {
+        // Height filter
+        if (filter_height && point.z > max_z) continue;
+
+        // Radius filter
+        if (filter_radius) {
+            const float dx = point.x - origin.x();
+            const float dy = point.y - origin.y();
+            if (dx * dx + dy * dy > max_radius_sq) continue;
+        }
+
+        filtered_cloud->push_back(point);
+    }
+
+    cloud->swap(*filtered_cloud);
+}
 
 } // namespace spade_pgo

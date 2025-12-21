@@ -46,6 +46,8 @@ private:
         int kf_index,
         int num_kf_accumulate) const;
 
+    void preprocessPointCloud_(pcl::PointCloud<PointType>::Ptr& cloud, const Eigen::Isometry3d& T_origin) const;
+
     std::shared_ptr<PoseGraphManager> graph_manager_;
     std::shared_ptr<Visualizer> visualizer_;
     std::shared_ptr<PGOParams> params_;
