@@ -142,7 +142,7 @@ def load_poses(filepath):
 
 def main():
     parser = argparse.ArgumentParser(description="Assemble point clouds into LAS file.")
-    parser.add_argument("-i", "--input", required=True, help="Input data directory")
+    parser.add_argument("-i", "--input", required=False, default="/home/ros/save/pointclouds", help="Input data directory")
     parser.add_argument("-o", "--output", required=False, help="Output LAS file path")
     parser.add_argument("-s", "--start-frame", type=int, default=None,
                         help="Start keyframe index (inclusive)")

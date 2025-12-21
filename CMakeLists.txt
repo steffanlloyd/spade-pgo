@@ -87,5 +87,6 @@ catkin_install_python(
   PROGRAMS
     scripts/multiswarm_orchestrator.py
     scripts/assemble.py
+    scripts/grid_cleanup.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )

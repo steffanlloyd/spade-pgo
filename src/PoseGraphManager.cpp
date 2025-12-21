@@ -87,8 +87,8 @@ int PoseGraphManager::addKeyframe(const Eigen::Isometry3d &T, pcl::PointCloud<Po
         this->kf_pointclouds.push_back(pointcloud_downsampled);
         this->kf_poses_odom_.push_back(T);
         this->kf_timestamps_.push_back(time);
-        // Track which drone session this keyframe belongs to (for multi-drone swarm processing)
-        this->kf_drone_ids_.push_back(this->current_drone_id_);
+        // Track which session this keyframe belongs to (for multi-session processing)
+        this->kf_session_ids_.push_back(this->current_session_id_);
         kf_id = this->kf_poses_odom_.size() - 1;
     }
 
@@ -252,11 +252,15 @@ void PoseGraphManager::addPriorFactorandEstimate(const Eigen::Isometry3d &T, int
 {
     gtsam::Pose3 pose(T.matrix());
 
+    auto rotation_noise = this->params->useExternalOrientation() ?
+        this->params->graph.orientation_noise :
+        this->params->graph.prior_noise_rot;
+
     gtsam::noiseModel::Diagonal::shared_ptr noise =
     gtsam::noiseModel::Diagonal::Sigmas((Eigen::VectorXd(6) <<
-        this->params->graph.prior_noise_rot,
-        this->params->graph.prior_noise_rot,
-        this->params->graph.prior_noise_rot,
+        rotation_noise,
+        rotation_noise,
+        rotation_noise,
         this->params->graph.prior_noise_lin,
         this->params->graph.prior_noise_lin,
         this->params->graph.prior_noise_lin).finished()); // rad, meter
@@ -275,6 +279,24 @@ void PoseGraphManager::addPriorFactorandEstimate(const Eigen::Isometry3d &T, int
     }
 
     ROS_INFO("Added prior factor at keyframe %d", kf_id);
+}
+
+/**
+ * @brief Adds a GNSS factor to the pose graph at a specified keyframe index, and adds the estimate.
+ * @param kf_index The keyframe index for the GNSS factor.
+ * @param gnss_odom The GNSS odometry message.
+ * @param T The transformation matrix representing the prior pose.
+ */
+void PoseGraphManager::addGNSSFactorAndEstimate(int kf_index, nav_msgs::Odometry::ConstPtr gnss_odom, const Eigen::Isometry3d &T)
+{
+    // Add estimate
+    {
+        std::lock_guard<std::mutex> lock(this->graph_mtx_);
+        this->kf_isam_estimates_.insert(kf_index, gtsam::Pose3(T.matrix()));
+    }
+
+    // Force add GNSS factor
+    this->addGNSSFactor(kf_index, gnss_odom, true);  // force_add = true
 }
 
 /**
@@ -368,7 +390,7 @@ double PoseGraphManager::distanceTravelledGNSS_() const
  * 
  * @param gnss_odom Pointer to a GNSS odometry message.
  */
-void PoseGraphManager::addGNSSFactor(int kf_index, nav_msgs::Odometry::ConstPtr gnss_odom)
+void PoseGraphManager::addGNSSFactor(int kf_index, nav_msgs::Odometry::ConstPtr gnss_odom, bool force_add)
 {
     // Break out pose
     auto gnss_pose = gnss_odom->pose;
@@ -445,27 +467,41 @@ void PoseGraphManager::addGNSSFactor(int kf_index, nav_msgs::Odometry::ConstPtr 
     {
         std::lock_guard<std::mutex> lock(this->graph_mtx_);
 
-        if(this->gnss_initialized_){
-            // GNSS is already initalized, just add it normally
-            this->graph.add(factor);
-            ROS_DEBUG("Logging GPS measurement (to graph), kf %d: x = %.2f, y = %.2f, z = %.2f.", kf_index, gnss_pnt.x(), gnss_pnt.y(), gnss_pnt.z());
+        // Determine whether to add immediately:
+        // - Already initialized: always add immediately
+        // - force_add: caller requested immediate addition (e.g., session initialization)
+        // - External orientation enabled: no need for delayed initialization since we have heading
+        bool add_immediately = this->gnss_initialized_ || force_add || this->params->useExternalOrientation();
 
-        }else{
-            // Check if we've travelled far enough to initialize GNSS
-            if(this->distanceTravelledGNSS_() > this->params->graph.gnss_min_initialization_distance){
-                // Distance travelled threshold is satisfied
-                // Initialize GNSS
+        if (add_immediately) {
+            // Flush any buffered factors first (if not yet initialized)
+            if (!this->gnss_initialized_) {
                 ROS_INFO("Initializing GNSS transform!");
-                while(!this->gnss_factor_buffer_.empty()){
+                while (!this->gnss_factor_buffer_.empty()) {
                     this->graph.add(this->gnss_factor_buffer_.front());
                     this->gnss_factor_buffer_.pop();
                 }
-                
+                this->gnss_initialized_ = true;
+                this->triggerExtraOptimization();
+            }
+
+            this->graph.add(factor);
+            ROS_DEBUG("Logging GPS measurement (to graph), kf %d: x = %.2f, y = %.2f, z = %.2f.", kf_index, gnss_pnt.x(), gnss_pnt.y(), gnss_pnt.z());
+        } else {
+            // Delayed adding: check if we've travelled far enough to initialize GNSS
+            if (this->distanceTravelledGNSS_() > this->params->graph.gnss_min_initialization_distance) {
+                // Distance travelled threshold is satisfied - initialize GNSS
+                ROS_INFO("Initializing GNSS transform!");
+                while (!this->gnss_factor_buffer_.empty()) {
+                    this->graph.add(this->gnss_factor_buffer_.front());
+                    this->gnss_factor_buffer_.pop();
+                }
+
                 this->graph.add(factor);
                 this->gnss_initialized_ = true;
                 this->triggerExtraOptimization();
-            }else{
-                // Just add the GNS Factor to the queue
+            } else {
+                // Just add the GNSS factor to the queue
                 this->gnss_factor_buffer_.push(factor);
                 ROS_DEBUG("Logging GPS measurement (to queue), kf %d: x = %.2f, y = %.2f, z = %.2f. Distance travelled: %.2f", kf_index, gnss_pnt.x(), gnss_pnt.y(), gnss_pnt.z(), this->distanceTravelledGNSS_());
             }
@@ -526,7 +562,7 @@ void PoseGraphManager::processData(DataPoint data)
     bool is_first_session = !this->graphInitialized();
 
     // Handle session initialization (either first session or after reinitializeSession())
-    if (!this->graphInitialized() || this->awaiting_session_init_) {
+    if (is_first_session || this->awaiting_session_init_) {
 
         // For multi-drone (non-first session), warn if GNSS/orientation disabled
         if (!is_first_session && (!this->params->useGNSS() || !this->params->useExternalOrientation())) {
@@ -558,17 +594,14 @@ void PoseGraphManager::processData(DataPoint data)
             ROS_INFO("Using external orientation for session start pose.");
         }
 
-        if (is_first_session) {
+        // Set initial position from GNSS, if available (and set datum)
+        if (this->params->useGNSS() && data.gnss_msg.has_value()) {
             // First session: start at origin, reset GNSS datum
-            this->T0_ = T_session_start;
-
-            if (this->params->useGNSS() && data.gnss_msg.has_value()) {
-                // Reset GNSS origin so first keyframe is at (0,0,0)
+            // Reset GNSS origin so first keyframe is at (0,0,0)
+            if (is_first_session){
                 this->navSatFixToOdometry(data.gnss_msg.value(), data.orientation_msg, true);
-            }
-        } else {
-            // Subsequent session: get position from GNSS in the existing coordinate frame
-            if (this->params->useGNSS() && data.gnss_msg.has_value()) {
+            } else {
+                // Subsequent session: get position from GNSS in the existing coordinate frame
                 // Convert GNSS to local coordinates (using existing origin, NOT resetting)
                 auto gnss_odom = this->navSatFixToOdometry(data.gnss_msg.value(), data.orientation_msg, false);
                 T_session_start.translation() = Eigen::Vector3d(
@@ -576,24 +609,28 @@ void PoseGraphManager::processData(DataPoint data)
                     gnss_odom->pose.pose.position.y,
                     gnss_odom->pose.pose.position.z
                 );
-                ROS_INFO("Using GNSS position for session start: x=%.2f, y=%.2f, z=%.2f",
-                         T_session_start.translation().x(),
-                         T_session_start.translation().y(),
-                         T_session_start.translation().z());
             }
         }
 
         // Add keyframe (index determined by current kf_poses_odom_ size)
+        this->T0_ = T_session_start;
         int new_kf_index = this->addKeyframe(T_session_start, pointcloud, data.timestamp_lio);
 
-        // Add prior factor at the new keyframe index
-        this->addPriorFactorandEstimate(T_session_start, new_kf_index);
+        // Add initial factor and estimate
+        if (this->params->useGNSS() && data.gnss_msg.has_value()) {
+            // GNSS available: add the estimate directly and use addGNSSFactor for the constraint
+            auto gnss_odom = this->navSatFixToOdometry(data.gnss_msg.value(), data.orientation_msg, false);
+            this->addGNSSFactorAndEstimate(new_kf_index, gnss_odom, T_session_start);
+        } else {
+            // No GNSS: use prior factor with fixed noise
+            this->addPriorFactorandEstimate(T_session_start, new_kf_index);
+        }
 
         // Clear awaiting flag
         this->awaiting_session_init_ = false;
 
-        ROS_INFO("Initialized session (drone %d) at keyframe %d: %s",
-                 this->current_drone_id_, new_kf_index, isometryToStr(T_session_start).c_str());
+        ROS_INFO("Initialized session %d at keyframe %d: %s",
+                 this->current_session_id_, new_kf_index, isometryToStr(T_session_start).c_str());
         return;
     }
 
@@ -601,7 +638,6 @@ void PoseGraphManager::processData(DataPoint data)
     Eigen::Isometry3d T_delta = this->T_odom_prev_.inverse() * T_odom;
 
     // Compute the "estimated" pose from LIO
-    // Warning: May be a problem setting current pose so far from the addKeyframe part. Fix?
     Eigen::Isometry3d T_kf = this->kf_poses_odom_.back() * T_delta;
     Eigen::Isometry3d T_kf_updated = this->estimateUpdatedPose(T_kf);
     this->setCurrentPose(T_kf_updated);
@@ -718,7 +754,7 @@ void PoseGraphManager::saveGraphKeyframes() const
     if(!this->graphInitialized()) return;
 
     std::string filename_kf = this->params->ros.save_directory + "optimized_poses.txt";
-    saveTransformsToFile(this->getUpdatedKFPoses(), this->kf_drone_ids_, filename_kf);
+    saveTransformsToFile(this->getUpdatedKFPoses(), this->kf_session_ids_, filename_kf);
 
     if(!this->gnss_origin_) return;
 
@@ -820,21 +856,19 @@ nav_msgs::Odometry::ConstPtr PoseGraphManager::navSatFixToOdometry(
 }
 
 /**
- * @brief Re-initializes the PGO session for a new drone in a multi-drone swarm.
+ * @brief Re-initializes the PGO session for a new session in a multi-session run.
  *
- * Increments the drone ID, records the session boundary, clears the data buffer,
- * and sets the flag to await session initialization on the next processData call.
- * The ScanContext database is preserved to enable inter-drone loop closures.
+ * Increments the session ID, clears the data buffer, and sets the flag to await
+ * session initialization on the next processData call.
+ * The ScanContext database is preserved to enable inter-session loop closures.
  *
  * @return The next keyframe index that will be used for the new session.
  */
 int PoseGraphManager::reinitializeSession()
 {
-    this->current_drone_id_++;
+    this->current_session_id_++;
 
     int next_kf_index = this->kf_poses_odom_.size();
-    this->session_start_indices_.push_back(next_kf_index);
-    this->session_drone_ids_.push_back(this->current_drone_id_);
 
     this->data_buffer.clearAll();
 
@@ -848,41 +882,64 @@ int PoseGraphManager::reinitializeSession()
 
     this->awaiting_session_init_ = true;
 
-    ROS_INFO("Re-initialized session for drone %d. Next keyframe index: %d",
-             this->current_drone_id_, next_kf_index);
+    ROS_INFO("Re-initialized for session %d. Next keyframe index: %d",
+             this->current_session_id_, next_kf_index);
 
     return next_kf_index;
 }
 
 /**
- * @brief Returns the current drone ID for the active session.
+ * @brief Returns the current session ID.
  */
-uint8_t PoseGraphManager::getCurrentDroneId() const
+uint8_t PoseGraphManager::getCurrentSessionId() const
 {
-    return this->current_drone_id_;
+    return this->current_session_id_;
 }
 
 /**
- * @brief Returns the drone ID associated with each keyframe.
+ * @brief Returns the session ID for a specific keyframe.
+ * @param kf_index The keyframe index.
+ * @return The session ID, or 0 if index is out of bounds.
  */
-std::vector<uint8_t> PoseGraphManager::getKeyframeDroneIds() const
+uint8_t PoseGraphManager::getKeyframeSessionId(int kf_index) const
 {
     std::lock_guard<std::mutex> lock(this->kf_mtx_);
-    return this->kf_drone_ids_;
+    if (kf_index < 0 || kf_index >= static_cast<int>(this->kf_session_ids_.size())) {
+        return 0;
+    }
+    return this->kf_session_ids_.at(kf_index);
 }
 
 /**
- * @brief Returns session boundary information as pairs of (start_index, drone_id).
+ * @brief Returns the session ID associated with each keyframe.
+ */
+std::vector<uint8_t> PoseGraphManager::getKeyframeSessionIds() const
+{
+    std::lock_guard<std::mutex> lock(this->kf_mtx_);
+    return this->kf_session_ids_;
+}
+
+/**
+ * @brief Returns session boundary information as pairs of (start_index, session_id).
  */
 std::vector<std::pair<int, uint8_t>> PoseGraphManager::getSessionBoundaries() const
 {
+    std::lock_guard<std::mutex> lock(this->kf_mtx_);
+
     std::vector<std::pair<int, uint8_t>> boundaries;
 
-    // First session always starts at index 0 with drone_id 0
-    boundaries.push_back({0, 0});
+    if (this->kf_session_ids_.empty()) {
+        return boundaries;
+    }
 
-    for (size_t i = 0; i < this->session_start_indices_.size(); ++i) {
-        boundaries.push_back({this->session_start_indices_[i], this->session_drone_ids_[i]});
+    // First session always starts at index 0
+    boundaries.push_back({0, this->kf_session_ids_[0]});
+
+    // Find where session ID changes
+    for (size_t i = 1; i < this->kf_session_ids_.size(); ++i) {
+        if (this->kf_session_ids_[i] != this->kf_session_ids_[i - 1]) {
+            boundaries.push_back({static_cast<int>(i), this->kf_session_ids_[i]});
+        }
     }
 
     return boundaries;

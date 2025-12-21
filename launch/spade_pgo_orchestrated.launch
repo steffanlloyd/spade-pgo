@@ -1,0 +1,22 @@
+<launch>
+    <!-- SPADE-PGO launch file for use with multiswarm_orchestrator.py -->
+    <!-- Config file argument (required - contains spade_pgo: namespace) -->
+    <arg name="config"/>
+    <arg name="rviz" default="true"/>
+
+    <!-- Load config at root level - YAML structure handles namespacing -->
+    <!-- The config file should contain spade_pgo: for PGO params -->
+    <rosparam command="load" file="$(arg config)"/>
+
+    <!-- PGO node -->
+    <node pkg="spade_pgo" type="spade_pgo_node" name="spade_pgo_node" output="screen">
+        <remap from="/cloud_for_scancontext" to="/cloud_registered"/>
+    </node>
+
+    <!-- RViz for PGO visualization -->
+    <group if="$(arg rviz)">
+        <node launch-prefix="nice"
+            pkg="rviz" type="rviz" name="rviz_pgo"
+            args="-d $(find spade_pgo)/rviz_cfg/spade_pgo.rviz"/>
+    </group>
+</launch>

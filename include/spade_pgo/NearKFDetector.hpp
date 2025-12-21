@@ -14,7 +14,9 @@ public:
     NearKFDetector(std::shared_ptr<PGOParams> params);
     ~NearKFDetector();
 
-    std::vector<std::pair<int, int>> getNearKFCandidates(const std::vector<Eigen::Isometry3d>& kf_updated);
+    std::vector<std::pair<int, int>> getNearKFCandidates(
+        const std::vector<Eigen::Isometry3d>& kf_updated,
+        const std::vector<uint8_t>& kf_drone_ids);
 
 private:
     std::shared_ptr<PGOParams> params_;

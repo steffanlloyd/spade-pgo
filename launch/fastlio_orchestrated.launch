@@ -1,0 +1,13 @@
+<launch>
+    <!-- FAST-LIO launch file for use with multiswarm_orchestrator.py -->
+    <!-- Config file argument (required - contains namespaced params) -->
+    <arg name="config"/>
+
+    <!-- Load config at root level - YAML structure handles namespacing -->
+    <!-- The config file should contain laserMapping: for private params -->
+    <!-- and common:, preprocess:, mapping:, etc. for global params -->
+    <rosparam command="load" file="$(arg config)"/>
+
+    <!-- FAST-LIO mapping node -->
+    <node pkg="fast_lio" type="fastlio_mapping" name="laserMapping" output="screen"/>
+</launch>

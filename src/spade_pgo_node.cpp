@@ -138,7 +138,7 @@ bool reinitSessionCallback(
 
     res.success = true;
     res.message = "Session reinitialized successfully";
-    res.drone_id = graph_manager->getCurrentDroneId();
+    res.drone_id = graph_manager->getCurrentSessionId();
     res.next_keyframe_index = next_kf_index;
 
     ROS_INFO("ReinitSession service called. New drone_id: %d, next_keyframe_index: %d",
@@ -163,7 +163,7 @@ void process_state_publisher(void)
         state_msg.header.stamp = ros::Time::now();
         state_msg.header.frame_id = "map";
 
-        state_msg.current_drone_id = graph_manager->getCurrentDroneId();
+        state_msg.current_drone_id = graph_manager->getCurrentSessionId();
         state_msg.num_keyframes = graph_manager->graphSize();
         state_msg.graph_initialized = graph_manager->graphInitialized();
         state_msg.gnss_initialized = graph_manager->isGNSSInitialized();

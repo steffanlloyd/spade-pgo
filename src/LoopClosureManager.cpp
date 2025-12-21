@@ -56,7 +56,9 @@ void LoopClosureManager::updateCandidateQueue()
 {
     if(this->params_->near_kf.enabled){
         // Get and add near KF candidates
-        auto candidates_near_kf = this->near_kf_detector.getNearKFCandidates(this->graph_manager_->getUpdatedKFPoses());
+        auto candidates_near_kf = this->near_kf_detector.getNearKFCandidates(
+            this->graph_manager_->getUpdatedKFPoses(),
+            this->graph_manager_->getKeyframeSessionIds());
 
         for (const auto& candidate : candidates_near_kf){
             ROS_INFO("Added near_kf loop closure candidate between %d and %d", candidate.first, candidate.second);
@@ -99,8 +101,8 @@ void LoopClosureManager::processCandidateQueue()
             candidate_pair = this->candidate_queue_.front();
 
             // We can't process loop closures until the pose has been updated by the graph.
-            // Skip any that are not updated.
-            if(candidate_pair.first >= this->graph_manager_->updatedKFIndex() || candidate_pair.second >= this->graph_manager_->updatedKFIndex()){
+            // Skip any that are not updated yet.
+            if(candidate_pair.first > this->graph_manager_->updatedKFIndex() || candidate_pair.second > this->graph_manager_->updatedKFIndex()){
                 break;
             }
 

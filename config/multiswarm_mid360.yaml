@@ -1,0 +1,123 @@
+# ==============================================================================
+# Combined config for SPADE-PGO multiswarm orchestrator (MID-360)
+# ==============================================================================
+# This file combines FAST-LIO and SPADE-PGO parameters for use with the
+# multiswarm_orchestrator.py script. Load at root level (no namespace).
+#
+# Usage:
+#   rosrun spade_pgo multiswarm_orchestrator.py /path/to/bags \
+#       --config spade_pgo config/multiswarm_mid360.yaml
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# FAST-LIO parameters (all at global scope - FAST-LIO uses global NodeHandle)
+# ------------------------------------------------------------------------------
+
+# Top-level parameters (no prefix)
+max_iteration: 6                    # Max solver iterations per optimization step
+filter_size_corner: 0.5             # Voxel filter for corner features [m]
+filter_size_surf: 0.5               # Voxel filter for surf features [m]
+filter_size_map: 0.5                # Voxel size for map downsampling [m]
+cube_side_length: 1000.0            # Side length of map cube [m]
+point_filter_num: 3                 # Min neighbors for point to be kept
+feature_extract_enable: false       # Feature extraction (not needed for Livox)
+runtime_pos_log_enable: false       # Log pose to disk during runtime
+
+# common/ prefix
+common:
+  lid_topic: "/livox/lidar"
+  imu_topic: "/livox/imu"
+  time_sync_en: false
+  time_offset_lidar_to_imu: 0.0
+
+# preprocess/ prefix
+preprocess:
+  lidar_type: 1                     # 1=Livox, 2=Velodyne, 3=Ouster
+  scan_line: 4
+  blind: 0.5
+
+# mapping/ prefix
+mapping:
+  acc_cov: 0.1
+  gyr_cov: 0.1
+  b_acc_cov: 0.0001
+  b_gyr_cov: 0.0001
+  fov_degree: 360
+  det_range: 100.0
+  extrinsic_est_en: false           # Enable online estimation of IMU-LiDAR extrinsic
+  extrinsic_T: [-0.011, -0.02329, 0.04412]
+  extrinsic_R: [1, 0, 0, 0, 1, 0, 0, 0, 1]
+
+# publish/ prefix
+publish:
+  path_en: false
+  scan_publish_en: true
+  dense_publish_en: true
+  scan_bodyframe_pub_en: true       # Output point cloud in IMU-body-frame
+
+# pcd_save/ prefix
+pcd_save:
+  pcd_save_en: false                # Disable - SPADE-PGO handles point cloud saving
+  interval: -1
+
+# ------------------------------------------------------------------------------
+# SPADE-PGO parameters (under spade_pgo/ namespace)
+# ------------------------------------------------------------------------------
+spade_pgo:
+  # ROS I/O
+  ros:
+    gps_topic: "/mavros/global_position/global"
+    pointcloud_topic: "/cloud_registered_body"
+    orientation_topic: "/mavros/global_position/local"
+    orientation_msg_type: "odometry"
+    lio_odometry_topic: "/Odometry"
+    save_directory: "/home/ros/save/pointclouds/"
+
+  # ICP (registration of loop candidates / submaps)
+  icp:
+    algorithm: "small_gicp"         # icp, gicp, ndt, small_gicp, small_vgicp
+    num_kf_accumulate_past: 5       # Past keyframes for "old" submap
+    num_kf_accumulate_now: 2        # Recent keyframes for "current" submap
+    fitness_threshold: 0.3          # Accept loop if ICP MSE < threshold
+    voxel_size: 0.05                # Downsample voxel size before ICP [m]
+    max_correspondence_distance: 2.0
+    save_pointclouds: false
+    publish_pointclouds: false
+
+  # Pose Graph (node/edge creation & uncertainties)
+  graph:
+    kf_gap_lin: 1.0                 # Linear travel between keyframes [m]
+    kf_gap_rot: 0.3                 # Rotational change between keyframes [rad]
+    lio_noise_lin: 5.0e-4           # LIO linear noise std dev [m]
+    lio_noise_rot: 1.0e-3           # LIO rotational noise std dev [rad]
+    prior_noise_lin: 5.0            # Prior noise on initial position [m]
+    prior_noise_rot: 1.0            # Prior noise on initial orientation [rad]
+    use_gnss_altitude: true
+    gnss_min_initialization_distance: 15.0  # Distance before enabling GNSS [m]
+    gps_noise_threshold: 1e9        # Max covariance for GNSS fix
+    gps_noise_scale: 10.0           # Variance scaling for GNSS XY
+    gps_noise_z_scale: 100.0        # Variance scaling for GNSS Z
+    loop_closure_noise_scale: 3e-3
+    orientation_noise: 1.0          # Orientation noise std dev [rad]
+
+  # Scan Context (loop candidate search)
+  sc:
+    enabled: false
+    distance_threshold: 0.3         # Cosine distance threshold
+    max_radius: 30.0                # Max radius of SC ring keys [m]
+    voxel_size: 0.2                 # Downsampling for SC descriptors [m]
+
+  # Near-keyframe loop closure
+  near_kf:
+    enabled: true
+    distance_threshold: 10.0        # Consider keyframes within this radius [m]
+    min_consecutive_kf_distance: 3.0  # Min travel between candidates [m]
+    min_kf_seperation: 30           # Min keyframe index separation
+
+  # Visualization
+  visualize:
+    voxel_size: 0.3                 # Downsampling for visualization [m]
+
+  # Extrinsics
+  extrinsics:
+    lidar_to_body_rpy: [0.0, 0.4363, 0.0]  # [roll, pitch, yaw] in radians (25 deg pitch)

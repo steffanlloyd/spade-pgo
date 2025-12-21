@@ -60,16 +60,18 @@ public:
     void setLoopClosureManager(std::shared_ptr<LoopClosureManager> lc_manager);
 
     int reinitializeSession();
-    uint8_t getCurrentDroneId() const;
-    std::vector<uint8_t> getKeyframeDroneIds() const;
+    uint8_t getCurrentSessionId() const;
+    uint8_t getKeyframeSessionId(int kf_index) const;
+    std::vector<uint8_t> getKeyframeSessionIds() const;
     std::vector<std::pair<int, uint8_t>> getSessionBoundaries() const;
     bool isGNSSInitialized() const;
 
     void processData(DataPoint data);
     int addKeyframe(const Eigen::Isometry3d &T, pcl::PointCloud<PointType>::Ptr &pointcloud, double time);
     void addPriorFactorandEstimate(const Eigen::Isometry3d &T, int kf_id = -1);
+    void addGNSSFactorAndEstimate(int kf_index, nav_msgs::Odometry::ConstPtr gnss_odom, const Eigen::Isometry3d &T);
     void addOdometryFactorAndEstimate(int kf_index, const Eigen::Isometry3d &T, Eigen::Isometry3d &T_est);
-    void addGNSSFactor(int kf_index, nav_msgs::Odometry::ConstPtr gnss_odom);
+    void addGNSSFactor(int kf_index, nav_msgs::Odometry::ConstPtr gnss_odom, bool force_add = false);
     void addLoopClosureFactor(int kf_index_1, int kf_index_2, Eigen::Isometry3d Ticp, double fitnessScore);
 
     nav_msgs::Odometry::ConstPtr navSatFixToOdometry(
@@ -122,11 +124,9 @@ private:
 
     mutable std::fstream pg_laser_timestamp_save_;
 
-    // Multi-drone session tracking
-    uint8_t current_drone_id_ = 0;
-    std::vector<uint8_t> kf_drone_ids_;
-    std::vector<int> session_start_indices_;
-    std::vector<uint8_t> session_drone_ids_;
+    // Multi-session tracking
+    uint8_t current_session_id_ = 0;
+    std::vector<uint8_t> kf_session_ids_;
     bool awaiting_session_init_ = false;
 
     // Odometry tracking (reset per session for multi-drone support)
