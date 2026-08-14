@@ -243,3 +243,5 @@ log/
 
 # Catkin custom files
 CATKIN_IGNORE
+# Superseded scripts and configs, kept for reference.
+bak/
