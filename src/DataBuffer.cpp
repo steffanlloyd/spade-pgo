@@ -3,6 +3,7 @@
 #include "spade_pgo/common.hpp"
 
 // Standard includes
+#include <cmath>
 #include <optional>
 #include <tuple>
 #include <queue>
@@ -28,7 +29,40 @@ using namespace spade_pgo;
 
 namespace spade_pgo {
 
-    
+namespace {
+
+/**
+ * @brief Checks whether a NavSatFix can be turned into a factor.
+ *
+ * Receivers emit status = -1 with covariance -1.0 before they have a fix. Those variances
+ * become NaN sigmas downstream and eventually an indeterminate system in iSAM2.
+ */
+bool isUsableFix(const sensor_msgs::NavSatFix& fix, std::string& reason)
+{
+    if (fix.status.status < sensor_msgs::NavSatStatus::STATUS_FIX) {
+        reason = "no fix (status " + std::to_string(static_cast<int>(fix.status.status)) + ")";
+        return false;
+    }
+    if (!std::isfinite(fix.latitude) || !std::isfinite(fix.longitude) || !std::isfinite(fix.altitude)) {
+        reason = "non-finite lat/lon/alt";
+        return false;
+    }
+    // Diagonal of the 3x3 covariance; zero is as unusable as negative (infinitely confident fix)
+    if (fix.position_covariance[0] <= 0.0 ||
+        fix.position_covariance[4] <= 0.0 ||
+        fix.position_covariance[8] <= 0.0) {
+        reason = "non-positive position covariance diagonal ("
+                 + std::to_string(fix.position_covariance[0]) + ", "
+                 + std::to_string(fix.position_covariance[4]) + ", "
+                 + std::to_string(fix.position_covariance[8]) + ")";
+        return false;
+    }
+    return true;
+}
+
+} // namespace
+
+
 /**
  * @brief Pushes an odometry message into the odometry buffer.
  * 
@@ -52,12 +86,32 @@ void DataBuffer::pushPointCloud(const sensor_msgs::PointCloud2ConstPtr& cloud)
 }
 
 /**
- * @brief Pushes a GNSS message into the GNSS buffer.
- * 
- * @param cloud A constant pointer to the point cloud message to be pushed into the buffer.
+ * @brief Pushes a GNSS message into the GNSS buffer, dropping unusable fixes.
+ *
+ * @param gps A constant pointer to the GNSS message to be pushed into the buffer.
  */
 void DataBuffer::pushGNSS(const sensor_msgs::NavSatFix::ConstPtr &gps)
 {
+    std::string reason;
+    if (!isUsableFix(*gps, reason)) {
+        std::lock_guard<std::mutex> lock(this->buffer_mutex_);
+        this->gnss_rejected_count_++;
+        // Unthrottled for the first few: a handful at receiver startup is the normal case and
+        // the throttle would hide the count. Throttled after that in case a receiver is broken.
+        if (this->gnss_rejected_count_ <= 10) {
+            ROS_WARN("DataBuffer: rejected unusable GNSS fix (%s). "
+                     "Rejected %lu fix(es) this session.",
+                     reason.c_str(),
+                     static_cast<unsigned long>(this->gnss_rejected_count_));
+        } else {
+            ROS_WARN_THROTTLE(5, "DataBuffer: rejected unusable GNSS fix (%s). "
+                                 "Rejected %lu fix(es) this session.",
+                              reason.c_str(),
+                              static_cast<unsigned long>(this->gnss_rejected_count_));
+        }
+        return;
+    }
+
     std::lock_guard<std::mutex> lock(this->buffer_mutex_);
     this->gnss_buffer_.push(gps);
 }
@@ -185,7 +239,23 @@ void DataBuffer::clearAll()
     std::queue<sensor_msgs::NavSatFix::ConstPtr>().swap(this->gnss_buffer_);
     std::queue<Eigen::Quaterniond>().swap(this->orientation_buffer_);
 
+    if (this->gnss_rejected_count_ > 0) {
+        ROS_INFO("DataBuffer: %lu unusable GNSS fix(es) were rejected during the session just ended",
+                 static_cast<unsigned long>(this->gnss_rejected_count_));
+    }
+    this->gnss_rejected_count_ = 0;
+
     ROS_INFO("DataBuffer: All buffers cleared for session re-initialization");
+}
+
+
+/**
+ * @brief Returns the number of unusable GNSS fixes dropped since the last clearAll().
+ */
+uint64_t DataBuffer::gnssRejectedCount() const
+{
+    std::lock_guard<std::mutex> lock(this->buffer_mutex_);
+    return this->gnss_rejected_count_;
 }
 
 

@@ -1,0 +1,176 @@
+# ==============================================================================
+# Release config for the hand-carried HeadSens sequences (Campaign B, MID-360)
+# ==============================================================================
+# Built as: the solver parameters of multiswarm_mid360.yaml (Campaign C, the most
+# recent and the one that produced the validated 20251217_attempt2 merge), with the
+# HARDWARE settings taken from spade/config/pgo_headsens.yaml -- the config that
+# actually ran this rig.
+#
+# The distinction matters because Campaign B is a different physical instrument, and
+# the drone config would silently mis-describe it in four ways:
+#
+#   1. NO lidar-to-body pitch. pgo_headsens.yaml has no `extrinsics:` block at all and
+#      therefore ran on the node default [0, 0, 0]. The 25 deg pitch in
+#      multiswarm_mid360.yaml describes the tilted MID-360 mount on the aircraft;
+#      applying it here would pitch every Campaign B cloud by 25 degrees. Written out
+#      explicitly below so it can never be inherited by accident.
+#   2. GNSS comes from the Septentrio receiver, not from mavros.
+#   3. NO magnetometer on HeadSens, so there is no heading source and the initial
+#      orientation is unknown. prior_noise_rot stays at the HeadSens value of 3.0 rad
+#      rather than the drone's 1.0 -- the drone knows its heading from mavros, this rig
+#      does not, and claiming otherwise would over-constrain the first pose.
+#      NOTE: prior_noise_rot is load-bearing here. Without an orientation source the
+#      node's GNSS constraint is a position-only GPSFactor, so this prior is the ONLY
+#      thing constraining the first keyframe's rotation. It must stay finite; a graph
+#      with no rotational constraint on variable 0 is singular and iSAM2 throws
+#      IndeterminantLinearSystemException. See PoseGraphManager::addRotationPriorFactor.
+#   4. NO consumable orientation stream. The Septentrio publishes
+#      geometry_msgs/PoseWithCovarianceStamped on /septentrio_gnss/pose; the node
+#      accepts only nav_msgs/Odometry or geometry_msgs/Quaternion. So external
+#      orientation is genuinely unavailable, not merely unconfigured. This was also the
+#      real state of pgo_headsens.yaml, which set the dead key `heading_topic` that the
+#      node has never read (qc_report.md 2.8).
+#
+# Everything else -- ICP, keyframing, GNSS weighting, loop closure, ScanContext,
+# near-keyframe search -- is Campaign C's, unchanged. That includes canopy exclusion
+# (max_height_above_ground 7.0), which pgo_headsens.yaml left off by default; the goal
+# is the best achievable assembly, not a byte-identical rerun of the original.
+#
+# gps_topic is the RAW Septentrio fix, not `navsat_fix_corrected`. The DEM
+# terrain-correction node belongs to the single-flight launch path and is not started
+# by the orchestrator, so the corrected topic would never be published and GNSS would
+# silently never initialise. It also keeps altitude handling the same as Campaigns A
+# and C instead of giving Campaign B alone a DEM-derived height prior.
+#
+# The FAST-LIO block is included because the orchestrator loads one combined file where
+# the launch path loaded fastlio_mid360.yaml + mid360.yaml separately. Those two are
+# parameter-for-parameter identical to Campaign C's FAST-LIO block apart from
+# pcd_save_en, which is false here because SPADE-PGO does the saving.
+#
+# Usage:
+#   rosrun spade_pgo multiswarm_orchestrator.py /path/to/bags \
+#       --config spade_pgo config/release_septentrio_mid360.yaml
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# FAST-LIO parameters (all at global scope - FAST-LIO uses global NodeHandle)
+# ------------------------------------------------------------------------------
+max_iteration: 6
+filter_size_corner: 0.5
+filter_size_surf: 0.5
+filter_size_map: 0.5
+cube_side_length: 1000.0
+point_filter_num: 3
+feature_extract_enable: false
+runtime_pos_log_enable: false
+
+common:
+  lid_topic: "/livox/lidar"
+  imu_topic: "/livox/imu"
+  time_sync_en: false
+  time_offset_lidar_to_imu: 0.0
+
+preprocess:
+  lidar_type: 1                     # 1=Livox, 2=Velodyne, 3=Ouster
+  scan_line: 4
+  blind: 0.5
+
+mapping:
+  acc_cov: 0.1
+  gyr_cov: 0.1
+  b_acc_cov: 0.0001
+  b_gyr_cov: 0.0001
+  fov_degree: 360
+  det_range: 100.0
+  extrinsic_est_en: false
+  extrinsic_T: [-0.011, -0.02329, 0.04412]   # IMU-to-lidar, internal to the MID-360
+  extrinsic_R: [1, 0, 0, 0, 1, 0, 0, 0, 1]
+
+publish:
+  path_en: false
+  scan_publish_en: true
+  dense_publish_en: true
+  scan_bodyframe_pub_en: true
+
+pcd_save:
+  pcd_save_en: false                # SPADE-PGO handles point cloud saving
+  interval: -1
+
+# ------------------------------------------------------------------------------
+# SPADE-PGO parameters
+# ------------------------------------------------------------------------------
+spade_pgo:
+  # ROS I/O -- HARDWARE SPECIFIC, from pgo_headsens.yaml
+  ros:
+    gps_topic: "/septentrio_gnss/navsatfix"
+    gps_topic_fallback: ""            # single GNSS source on this rig
+    imu_topic: "/livox/imu"
+    pointcloud_topic: "/cloud_registered_body"
+    lio_odometry_topic: "/Odometry"
+    orientation_topic: ""             # no consumable orientation on this rig; see header
+    orientation_msg_type: "odometry"
+    save_directory: "/home/ros/save/pointclouds/"
+
+  # Per-bag sensor checks run by the orchestrator before playback [Hz]
+  preflight:
+    min_lidar_rate: 5.0               # fatal below
+    min_imu_rate: 25.0                # fatal below
+    min_gnss_rate: 0.2                # degrade below (run without GNSS)
+    min_orientation_rate: 1.0         # degrade below (run without orientation)
+
+  # ICP -- Campaign C values, unchanged
+  icp:
+    algorithm: "small_gicp"
+    num_kf_accumulate_past: 4
+    num_kf_accumulate_now: 2
+    fitness_threshold: 0.3
+    min_inlier_ratio: 0.1
+    voxel_size: 0.05
+    max_correspondence_distance: 2.0
+    max_iterations: 40
+    max_height_above_ground: 7.0      # canopy exclusion ON
+    max_radius_from_keyframe: 20.0
+    zero_init_z: true               # Seed ICP with the two keyframes at equal height
+    save_pointclouds: false
+    publish_pointclouds: true
+
+  # Pose graph -- Campaign C values, except prior_noise_rot (no magnetometer)
+  graph:
+    kf_gap_lin: 1.0
+    kf_gap_rot: 0.3
+    lio_noise_lin: 5.0e-4
+    lio_noise_rot: 1.0e-3
+    prior_noise_lin: 5.0
+    prior_noise_rot: 1.0 
+    use_gnss: true
+    use_gnss_altitude: true
+    gnss_min_initialization_distance: 15.0
+    gnss_time_delta: 0.4              # Max keyframe-to-fix time gap for a match [s].
+    gps_noise_threshold: 1e9
+    gps_noise_scale: 10.0
+    gps_noise_z_scale: 10.0        # Variance scaling for GNSS Z
+    loop_closure_noise_scale: 1e-2
+    use_orientation_calibration: false
+    orientation_calibration_size: 20
+
+  sc:
+    enabled: false
+    distance_threshold: 0.3
+    max_radius: 30.0
+    voxel_size: 0.2
+
+  near_kf:
+    enabled: true
+    distance_threshold: 20.0        # Consider keyframes within this radius [m]
+    min_consecutive_kf_distance: 4.0  # Min travel between candidates [m] (intra-session only)
+    min_kf_seperation: 40           # Min keyframe index separation (intra-session only)
+
+  visualize:
+    voxel_size: 0.3
+
+  lidar_type: "MID360"
+
+  # HARDWARE SPECIFIC: identity, matching what pgo_headsens.yaml ran on. The
+  # hand-carried rig does not have the aircraft's tilted mount.
+  extrinsics:
+    lidar_to_body_rpy: [0.0, 0.0, 0.0]

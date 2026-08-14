@@ -1,5 +1,7 @@
 # Request to re-initialize PGO session for a new drone
-# No request parameters - drone_id is automatically assigned
+# drone_id is automatically assigned
+string gps_topic                # "" = GNSS disabled for this session
+string orientation_topic        # "" = external orientation disabled for this session
 ---
 # Response
 bool success

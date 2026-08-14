@@ -139,13 +139,14 @@ void Visualizer::publishMap(int frame_skip)
     // Assemble the global point cloud using updated poses
     pcl::PointCloud<PointType>::Ptr globalCloud = this->graph_manager_->assembleGlobalPointCloud(frame_skip);
 
-    // Downsample the map
+    // Downsample the map into a separate cloud: filtering in place aliases input and output.
+    pcl::PointCloud<PointType>::Ptr mapCloud(new pcl::PointCloud<PointType>());
     this->voxelizer_map_.setInputCloud(globalCloud);
-    this->voxelizer_map_.filter(*globalCloud);
+    this->voxelizer_map_.filter(*mapCloud);
 
     // Convert the point cloud to ROS message and publish
     sensor_msgs::PointCloud2 mapMsg;
-    pcl::toROSMsg(*globalCloud, mapMsg);
+    pcl::toROSMsg(*mapCloud, mapMsg);
     mapMsg.header.frame_id = "camera_init";
     this->publisher_map_.publish(mapMsg);
 }

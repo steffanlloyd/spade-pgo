@@ -43,10 +43,15 @@
 
 using namespace spade_pgo;
 
+std::shared_ptr<PGOParams> params;
 std::shared_ptr<PoseGraphManager> graph_manager;
 std::shared_ptr<Visualizer> visualizer;
 std::shared_ptr<LoopClosureManager> loop_closure_manager;
 ros::Publisher state_publisher;
+
+// Recreated per session by apply_session_topics(), so they live outside main()
+ros::Subscriber subscriber_gnss;
+ros::Subscriber subscriber_orientation;
 
 void process_pg()
 {
@@ -127,12 +132,73 @@ void process_viz_map(void)
     }
 } // pointcloud_viz
 
+// (Re)create the GNSS and orientation subscribers for a session.
+//
+// The node is launched once per run but each bag can come from different hardware, so the
+// orchestrator picks the topics per session and passes them through ReinitSession.
+// An empty string disables the feature for that session.
+void apply_session_topics(std::string gps_topic, std::string orientation_topic)
+{
+    ros::NodeHandle nh;
+
+    params->ros.gps_topic = std::move(gps_topic);
+    params->ros.orientation_topic = std::move(orientation_topic);
+    params->refreshFeatureFlags();
+
+    subscriber_gnss.shutdown();
+    if (params->useGNSS()) {
+        subscriber_gnss = nh.subscribe<sensor_msgs::NavSatFix>(
+            params->ros.gps_topic, 100,
+            std::function<void(const sensor_msgs::NavSatFix::ConstPtr&)>(
+                [](const sensor_msgs::NavSatFix::ConstPtr &gps) {
+                    graph_manager->data_buffer.pushGNSS(gps);
+                }
+            ));
+        ROS_INFO("Subscribed to GNSS topic: %s", params->ros.gps_topic.c_str());
+    } else {
+        ROS_WARN("GNSS DISABLED for this session. The session will start at the identity pose "
+                 "and is tied to the rest of the graph only by loop closures.");
+    }
+
+    subscriber_orientation.shutdown();
+    if (params->useExternalOrientation()) {
+        if (params->ros.orientation_msg_type == "odometry") {
+            subscriber_orientation = nh.subscribe<nav_msgs::Odometry>(
+                params->ros.orientation_topic, 100,
+                std::function<void(const nav_msgs::Odometry::ConstPtr&)>(
+                    [](const nav_msgs::Odometry::ConstPtr& odom) {
+                        graph_manager->data_buffer.pushOrientation(odom);
+                    }
+                ));
+        } else {
+            subscriber_orientation = nh.subscribe<geometry_msgs::Quaternion>(
+                params->ros.orientation_topic, 100,
+                std::function<void(const geometry_msgs::Quaternion::ConstPtr&)>(
+                    [](const geometry_msgs::Quaternion::ConstPtr& quat) {
+                        graph_manager->data_buffer.pushOrientation(quat);
+                    }
+                ));
+        }
+        ROS_INFO("Subscribed to orientation topic: %s (type %s)",
+                 params->ros.orientation_topic.c_str(), params->ros.orientation_msg_type.c_str());
+    } else {
+        // Two knock-on effects, neither of them obvious from the call site
+        ROS_WARN("External orientation DISABLED for this session. Two consequences: the session "
+                 "anchor uses prior_noise_rot (%.2f rad) instead of orientation_noise (%.2f rad), "
+                 "and GNSS factors are buffered until %.1f m of travel instead of being added "
+                 "immediately.",
+                 params->graph.prior_noise_rot, params->graph.orientation_noise,
+                 params->graph.gnss_min_initialization_distance);
+    }
+}
+
 // Service callback for reinitializing the PGO session for a new drone
 bool reinitSessionCallback(
     spade_pgo::ReinitSession::Request& req,
     spade_pgo::ReinitSession::Response& res)
 {
-    (void)req;
+    // Before reinitializeSession(), so its clearAll() flushes anything left from the old topics
+    apply_session_topics(req.gps_topic, req.orientation_topic);
 
     int next_kf_index = graph_manager->reinitializeSession();
 
@@ -194,7 +260,7 @@ int main(int argc, char **argv)
 	ros::init(argc, argv, "laserPGO");
 	ros::NodeHandle nh;
 
-    auto params = std::make_shared<PGOParams>();
+    params = std::make_shared<PGOParams>();
 
     //ICP Params
     nh.param<std::string>("spade_pgo/icp/algorithm", params->icp.algorithm, "small_gicp"); // icp, gicp, ndt, small_gicp, or small_vgicp
@@ -207,6 +273,7 @@ int main(int argc, char **argv)
     nh.param<int>("spade_pgo/icp/max_iterations", params->icp.max_iterations, 50); // Max ICP iterations
     nh.param<double>("spade_pgo/icp/max_height_above_ground", params->icp.max_height_above_ground, 0); // Filter points above this height relative to min z (0 = disabled)
     nh.param<double>("spade_pgo/icp/max_radius_from_keyframe", params->icp.max_radius_from_keyframe, 25); // Filter points beyond this distance from keyframe (0 = disabled)
+    nh.param<bool>("spade_pgo/icp/zero_init_z", params->icp.zero_init_z, false); // Seed ICP with the two keyframes at equal height
     nh.param<bool>("spade_pgo/icp/save_pointclouds", params->icp.save_pointclouds, false); // Save pointclouds to file (for post-processing)
     nh.param<bool>("spade_pgo/icp/publish_pointclouds", params->icp.publish_pointclouds, false); // Publish point clouds (for debugging)
 
@@ -223,6 +290,7 @@ int main(int argc, char **argv)
     nh.param<double>("spade_pgo/graph/gps_noise_z_scale", params->graph.gps_noise_z_scale, 1e2); // Scaling factor added to GPS altitude variance. Value will be squared, so 2x value is 2x less certainty
     nh.param<double>("spade_pgo/graph/orientation_noise", params->graph.orientation_noise, 0.1);
     nh.param<double>("spade_pgo/graph/gnss_min_initialization_distance", params->graph.gnss_min_initialization_distance, 5); // Min distance travelled before GNSS will initialize (too small will destabilize map. Should be higher than covariance of GNSS)
+    nh.param<double>("spade_pgo/graph/gnss_time_delta", params->graph.gnss_time_delta, 0.1); // Max timestamp gap between a keyframe and a GNSS fix for them to be matched (s)
     nh.param<double>("spade_pgo/graph/loop_closure_noise_scale", params->graph.loop_closure_noise_scale, 1); // Loop Noise scaling factor. Value will be squared
 
     // ScanControl parameters
@@ -247,6 +315,7 @@ int main(int argc, char **argv)
 	nh.param<std::string>("spade_pgo/ros/pointcloud_topic", params->ros.pointcloud_topic, "/cloud_registered_body"); // Should be local frame (registered to the sensor body)
 	nh.param<std::string>("spade_pgo/ros/lio_odometry_topic", params->ros.lio_odometry_topic, "/Odometry");
     nh.param<std::string>("spade_pgo/ros/save_directory", params->ros.save_directory, "/home/ros/save/pointclouds/");
+    params->refreshFeatureFlags();
 
     // Extrinsics: lidar to body transform as [roll, pitch, yaw] in radians
     std::vector<double> lidar_to_body_rpy;
@@ -306,42 +375,9 @@ int main(int argc, char **argv)
             }
         ));
 
-    // GNSS subscriber (only if topic is specified)
-    ros::Subscriber subscriber_gnss;
-    if (params->useGNSS()) {
-        subscriber_gnss = nh.subscribe<sensor_msgs::NavSatFix>(
-            params->ros.gps_topic, 100,
-            std::function<void(const sensor_msgs::NavSatFix::ConstPtr&)>(
-                [](const sensor_msgs::NavSatFix::ConstPtr &gps) {
-                    graph_manager->data_buffer.pushGNSS(gps);
-                }
-            ));
-        ROS_INFO("Subscribed to GNSS topic: %s", params->ros.gps_topic.c_str());
-    }
-
-    // Orientation subscriber (only if topic is specified)
-    // Handles both Odometry and Quaternion message types via generic subscriber
-    ros::Subscriber subscriber_orientation;
-    if (params->useExternalOrientation()) {
-        if (params->ros.orientation_msg_type == "odometry") {
-            subscriber_orientation = nh.subscribe<nav_msgs::Odometry>(
-                params->ros.orientation_topic, 100,
-                std::function<void(const nav_msgs::Odometry::ConstPtr&)>(
-                    [](const nav_msgs::Odometry::ConstPtr& odom) {
-                        graph_manager->data_buffer.pushOrientation(odom);
-                    }
-                ));
-        } else {
-            subscriber_orientation = nh.subscribe<geometry_msgs::Quaternion>(
-                params->ros.orientation_topic, 100,
-                std::function<void(const geometry_msgs::Quaternion::ConstPtr&)>(
-                    [](const geometry_msgs::Quaternion::ConstPtr& quat) {
-                        graph_manager->data_buffer.pushOrientation(quat);
-                    }
-                ));
-        }
-        ROS_INFO("Subscribed to orientation topic: %s (type %s)", params->ros.orientation_topic.c_str(), params->ros.orientation_msg_type.c_str());
-    }
+    // GNSS and orientation subscribers, from the config. The orchestrator overrides these
+    // per session through the reinit service.
+    apply_session_topics(params->ros.gps_topic, params->ros.orientation_topic);
 
 
 	std::thread posegraph_slam {process_pg}; // pose graph construction

@@ -72,7 +72,7 @@ public:
     void addGNSSFactorAndEstimate(int kf_index, nav_msgs::Odometry::ConstPtr gnss_odom, const Eigen::Isometry3d &T);
     void addOdometryFactorAndEstimate(int kf_index, const Eigen::Isometry3d &T, Eigen::Isometry3d &T_est);
     void addGNSSFactor(int kf_index, nav_msgs::Odometry::ConstPtr gnss_odom, bool force_add = false);
-    void addLoopClosureFactor(int kf_index_1, int kf_index_2, Eigen::Isometry3d Ticp, double fitnessScore);
+    void addLoopClosureFactor(int kf_index_1, int kf_index_2, Eigen::Isometry3d T_between, double fitnessScore);
 
     nav_msgs::Odometry::ConstPtr navSatFixToOdometry(
         const sensor_msgs::NavSatFix::ConstPtr& nav_sat_fix, 

@@ -7,6 +7,13 @@ and saves the merged result as a LAS file with per-point keyframe and drone meta
 
 Supports both single-drone and multi-drone (swarm) output formats.
 
+The output is georeferenced to EPSG:5972 (ETRS89 / UTM zone 32N + NN2000 height) using the
+datum in gnss_origin.txt. This is not a plain offset: the pose graph works in local ENU, and
+the conversion to grid coordinates removes the meridian convergence (~1.54 deg here) and the
+grid scale factor. Assembly aborts if the datum is missing or was written at insufficient
+precision, unless --allow-ungeoreferenced is given. Each run also writes
+<output>.provenance.json recording the datum, flags, keyframes and code version.
+
 USAGE
 -----
     rosrun spade_pgo assemble.py -i ~/save/pointclouds
@@ -20,6 +27,9 @@ ARGUMENTS
     -ir, --ignore-range STR Ignore keyframe ranges, e.g., '100-150' or '50-60,100-150'
     -es, --exclude-start N       Exclude first N keyframes from each drone session (default: 0)
     -ee, --exclude-end N         Exclude last N keyframes from each drone session (default: 0)
+    --origin LAT,LON,ALT    Override the GNSS datum instead of reading gnss_origin.txt
+    --epsg N                Output CRS (default: 5972)
+    --allow-ungeoreferenced Write a local-ENU file with no CRS instead of failing
 
 EXAMPLES
 --------
@@ -38,7 +48,11 @@ EXAMPLES
 
 import os
 import re
+import json
+import shutil
+import datetime
 import argparse
+import subprocess
 import numpy as np
 import open3d as o3d
 from numpy import linalg as LA
@@ -141,6 +155,266 @@ def load_poses(filepath):
     return poses, drone_ids, session_starts, offset_x, offset_y
 
 
+def load_gnss_origin(filepath):
+    """
+    Read gnss_origin.txt, written by PoseGraphManager::saveOptimizedPoses.
+
+    Format: 'latitude: <lat> longitude: <lon> altitude: <alt>', where the altitude is the
+    ellipsoidal height carried by the NavSatFix message. Returns (lat, lon, h) in degrees
+    and metres.
+    """
+    with open(filepath, "r") as f:
+        text = f.read()
+    vals = {}
+    for key in ("latitude", "longitude", "altitude"):
+        m = re.search(key + r"\s*:\s*(-?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?)", text)
+        if not m:
+            raise RuntimeError("Could not parse '%s' from %s" % (key, filepath))
+        vals[key] = float(m.group(1))
+
+    # Guard against the six-significant-figure truncation written by versions of
+    # PoseGraphManager.cpp before the std::setprecision(12) fix. At this latitude 1e-4 deg
+    # is ~11 m north-south, so a coarsely rounded datum cannot georeference a stem-level map.
+    for key in ("latitude", "longitude"):
+        s = re.search(key + r"\s*:\s*(-?\d+(?:\.\d+)?)", text).group(1)
+        decimals = len(s.split(".")[1]) if "." in s else 0
+        if decimals < 7:
+            raise RuntimeError(
+                "%s in %s has only %d decimal places (%s). This datum was written by an "
+                "older spade_pgo without the setprecision(12) fix and is accurate to no "
+                "better than a few metres. Re-run the pose graph, or pass --origin "
+                "LAT,LON,ALT explicitly if you have the full-precision values."
+                % (key, filepath, decimals, s))
+    return vals["latitude"], vals["longitude"], vals["altitude"]
+
+
+def build_georeference(lat0, lon0, h0, epsg_horizontal=25832, epsg_out=5972):
+    """
+    Build the transform from the pose graph's local ENU frame to a projected CRS.
+
+    The maps come out of the pose graph as local ENU about the first GNSS fix. ENU is NOT
+    UTM: at 10.79 deg E the meridian convergence is ~1.54 deg, so simply adding the origin's
+    easting/northing to the ENU coordinates rotates the map by that angle -- about 7.6 m of
+    error across a 400 m span. The grid scale factor (~0.99970) adds a further 0.03 %.
+
+    Both are removed here with a 2x2 linear map derived from a rigorous PROJ pipeline
+    (ENU -> geocentric -> geodetic -> UTM) evaluated at the origin. Compared against the
+    rigorous per-point transform over a +/-200 m grid the residual is under 1 mm, so the
+    linear form is exact for our purposes and costs one matrix multiply instead of a
+    projection call per point.
+
+    Vertically the origin's ellipsoidal height is converted to NN2000 orthometric height via
+    the geoid grid and the ENU 'up' component is added to it. Neglected: the geoid slope
+    across a site (order 1 cm over 300 m in this region) and the earth-curvature term in the
+    topocentric vertical (3 mm at 200 m).
+
+    Returns a dict describing the transform.
+    """
+    import pyproj
+    from pyproj.transformer import TransformerGroup
+
+    src_crs = pyproj.CRS.from_epsg(4937)
+    dst_crs = pyproj.CRS.from_epsg(epsg_out)
+
+    # PROJ does not raise when a geoid grid is missing. It quietly substitutes a "ballpark"
+    # vertical transformation that returns the ellipsoidal height unchanged -- a ~39 m error
+    # in Norway, shipped without any warning. Three independent guards, because getting this
+    # wrong is silent and the resulting file looks entirely plausible.
+    #
+    # Guard 1: no candidate operation may be unavailable for want of a grid.
+    tg = TransformerGroup(src_crs, dst_crs, always_xy=True)
+    missing = [g.short_name for op in tg.unavailable_operations for g in op.grids
+               if not g.available]
+    if missing:
+        raise RuntimeError(
+            "PROJ is missing transformation grid(s) %s, so it would silently fall back to a "
+            "ballpark vertical transformation and write ellipsoidal heights labelled as "
+            "NN2000 -- an error of roughly 39 m. Rebuild the Docker image (the grid is baked "
+            "in; see the Dockerfile) or set PROJ_NETWORK=ON." % ", ".join(sorted(set(missing))))
+
+    tr_v = pyproj.Transformer.from_crs(src_crs, dst_crs, always_xy=True)
+    e0, n0, H0 = tr_v.transform(lon0, lat0, h0)
+
+    # Guard 2: the description, once PROJ has resolved an operation. Note this is only
+    # populated after a transform has actually been run, and reads "unavailable until
+    # proj_trans is called" beforehand -- hence the ordering here, and guards 1 and 3.
+    if "ballpark" in (tr_v.description or "").lower():
+        raise RuntimeError(
+            "PROJ selected a ballpark vertical transformation (%s). Heights would be "
+            "ellipsoidal rather than NN2000." % tr_v.description)
+
+    # Guard 3: the arithmetic itself. The geoid-ellipsoid separation in southern Norway is
+    # roughly 35-45 m, so a genuine conversion always moves the height by tens of metres. An
+    # unchanged height means no grid was applied, whatever PROJ reported.
+    if not np.isfinite(H0):
+        raise RuntimeError("Vertical transformation returned a non-finite height.")
+    if abs(H0 - h0) < 1.0:
+        raise RuntimeError(
+            "Vertical transformation changed the height by only %.4f m (%.4f -> %.4f). The "
+            "geoid-ellipsoid separation here is tens of metres, so the grid was evidently "
+            "not applied and the height is still ellipsoidal." % (abs(H0 - h0), h0, H0))
+
+    # --- horizontal: local ENU -> projected easting/northing ---
+    pipe = ("+proj=pipeline "
+            "+step +inv +proj=topocentric +ellps=GRS80 "
+            "+lat_0=%.12f +lon_0=%.12f +h_0=%.6f "
+            "+step +inv +proj=cart +ellps=GRS80 "
+            "+step +proj=utm +zone=32 +ellps=GRS80" % (lat0, lon0, h0))
+    tr_h = pyproj.Transformer.from_pipeline(pipe)
+
+    x0, y0, _ = tr_h.transform(0.0, 0.0, 0.0)
+    L = 1000.0
+    xe, ye, _ = tr_h.transform(L, 0.0, 0.0)   # ENU east  basis vector
+    xn, yn, _ = tr_h.transform(0.0, L, 0.0)   # ENU north basis vector
+    A = np.array([[(xe - x0) / L, (xn - x0) / L],
+                  [(ye - y0) / L, (yn - y0) / L]], dtype=np.float64)
+
+    scale = float(np.hypot(A[0, 0], A[1, 0]))
+    convergence_deg = float(np.degrees(np.arctan2(-A[1, 0], A[0, 0])))
+
+    # Sanity: the two derived bases must agree with the CRS transform of the origin itself.
+    if abs(x0 - e0) > 0.01 or abs(y0 - n0) > 0.01:
+        raise RuntimeError(
+            "Horizontal pipeline and CRS transform disagree at the origin: "
+            "(%.4f, %.4f) vs (%.4f, %.4f)" % (x0, y0, e0, n0))
+
+    return {
+        "origin_lat": lat0, "origin_lon": lon0, "origin_ellipsoidal_h": h0,
+        "epsg": epsg_out, "epsg_horizontal": epsg_horizontal,
+        "easting": x0, "northing": y0, "orthometric_h": H0,
+        "linear_map": A, "grid_scale_factor": scale,
+        "meridian_convergence_deg": -convergence_deg,
+        "vertical_operation": tr_v.description,
+        # The applied geoid-ellipsoid separation. Recorded because it is the one number
+        # that proves a real vertical transformation happened: a ballpark fallback leaves
+        # it at exactly zero.
+        "geoid_separation_m": h0 - H0,
+    }
+
+
+def write_trajectories(output_path, data_dir, georef):
+    """
+    Write the keyframe trajectories beside the cloud, in the cloud's own CRS.
+
+    Two files where both pose sets exist: the optimised trajectory and the odometry-only
+    one. Their difference is the drift the pose graph removed. Neither was retained by any
+    previous run, which is why the drift figures quoted in D4.2 cannot currently be
+    reproduced from the released data.
+    """
+    stem = os.path.splitext(output_path)[0]
+    written = []
+    for src_name, suffix in (("optimized_poses.txt", ".traj.csv"),
+                             ("odometry_poses.txt", ".traj_odom.csv")):
+        src = os.path.join(data_dir, src_name)
+        if not os.path.exists(src):
+            continue
+        poses, drone_ids, _, off_x, off_y = load_poses(src)
+        if not poses:
+            continue
+        path = stem + suffix
+        with open(path, "w") as f:
+            if georef:
+                f.write("# CRS EPSG:%d\n" % georef["epsg"])
+                f.write("keyframe,session,easting,northing,height\n")
+                A = georef["linear_map"]
+                for kf in sorted(poses):
+                    t = poses[kf][:3, 3]
+                    e, n = t[0] + off_x, t[1] + off_y
+                    f.write("%d,%d,%.4f,%.4f,%.4f\n" % (
+                        kf, drone_ids.get(kf, 0),
+                        georef["easting"] + A[0, 0] * e + A[0, 1] * n,
+                        georef["northing"] + A[1, 0] * e + A[1, 1] * n,
+                        georef["orthometric_h"] + t[2]))
+            else:
+                f.write("# local ENU, no CRS\n")
+                f.write("keyframe,session,x,y,z\n")
+                for kf in sorted(poses):
+                    t = poses[kf][:3, 3]
+                    f.write("%d,%d,%.4f,%.4f,%.4f\n" % (
+                        kf, drone_ids.get(kf, 0), t[0] + off_x, t[1] + off_y, t[2]))
+        written.append(os.path.basename(path))
+        print(f"Trajectory written: {path}")
+    return written
+
+
+def write_provenance(output_path, data_dir, args, georef, kf_files, drone_ids,
+                     session_starts, n_points, filter_params):
+    """
+    Write <output>.provenance.json next to the LAS.
+
+    The existing release clouds carry no record of which bags, flags or code version
+    produced them, which is why none of them could be reproduced or georeferenced after the
+    fact. Every assembly from here on states its own provenance.
+    """
+    def git_describe(path):
+        # spade-pgo is a submodule: its .git is a file pointing into the parent repo's
+        # .git/modules, so rev-parse fails whenever only ros1_ws/ is bind-mounted into the
+        # container. Let the caller supply the hash instead of silently recording nothing.
+        env_commit = os.environ.get("SPADE_PGO_COMMIT")
+        if env_commit:
+            return env_commit.strip()
+        # safe.directory: the checkout is bind-mounted from the host and owned by a
+        # different uid inside the container, which git otherwise refuses to read.
+        try:
+            return subprocess.check_output(
+                ["git", "-c", "safe.directory=*", "-C", path, "rev-parse", "HEAD"],
+                stderr=subprocess.DEVNULL).decode().strip()
+        except Exception:
+            return None
+
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    kf_indices = [idx for idx, _ in kf_files]
+
+    prov = {
+        "generated_utc": datetime.datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        "generator": "spade_pgo/assemble.py",
+        "git_commit": git_describe(script_dir),
+        "input_directory": os.path.abspath(data_dir),
+        "output": os.path.abspath(output_path),
+        "arguments": {k: v for k, v in vars(args).items()},
+        "filters": filter_params,
+        "keyframes": {
+            "count": len(kf_indices),
+            "min": min(kf_indices) if kf_indices else None,
+            "max": max(kf_indices) if kf_indices else None,
+            "session_starts": list(session_starts),
+            "drones": sorted(set(drone_ids.values())),
+        },
+        "n_points": int(n_points),
+        "georeference": None,
+    }
+    if georef:
+        prov["georeference"] = {
+            "epsg": georef["epsg"],
+            "datum_lat": georef["origin_lat"],
+            "datum_lon": georef["origin_lon"],
+            "datum_ellipsoidal_h": georef["origin_ellipsoidal_h"],
+            "origin_easting": georef["easting"],
+            "origin_northing": georef["northing"],
+            "origin_orthometric_h": georef["orthometric_h"],
+            "linear_map_row_major": georef["linear_map"].ravel().tolist(),
+            "grid_scale_factor": georef["grid_scale_factor"],
+            "meridian_convergence_deg": georef["meridian_convergence_deg"],
+            "vertical_operation": georef["vertical_operation"],
+            "geoid_separation_m": georef["geoid_separation_m"],
+        }
+
+    # The pose graph's own outputs are the expensive artefact and are wiped on the next
+    # node launch. Keep a copy of the datum alongside the cloud it produced.
+    for name in ("gnss_origin.txt", "optimized_poses.txt", "odometry_poses.txt",
+                 "pgo_run.json", "config_used.yaml"):
+        src = os.path.join(data_dir, name)
+        if os.path.exists(src):
+            dst = os.path.splitext(output_path)[0] + "." + name
+            shutil.copy2(src, dst)
+            prov.setdefault("copied_alongside", []).append(os.path.basename(dst))
+
+    prov_path = os.path.splitext(output_path)[0] + ".provenance.json"
+    with open(prov_path, "w") as f:
+        json.dump(prov, f, indent=2)
+    print(f"Provenance written: {prov_path}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Assemble point clouds into LAS file.")
     parser.add_argument("-i", "--input", required=False, default="/home/ros/save/pointclouds", help="Input data directory")
@@ -155,6 +429,25 @@ def main():
                         help="Exclude first N keyframes from each drone session (default: 0)")
     parser.add_argument("-ee", "--exclude-end", type=int, default=0,
                         help="Exclude last N keyframes from each drone session (default: 0)")
+    parser.add_argument("--origin", type=str, default=None,
+                        help="Override the GNSS datum, as LAT,LON,ELLIPSOIDAL_ALT. "
+                             "Default: read gnss_origin.txt from the input directory")
+    parser.add_argument("--epsg", type=int, default=5972,
+                        help="Output CRS (default: 5972, ETRS89 / UTM 32N + NN2000 height)")
+    parser.add_argument("--poses", type=str, default="optimized_poses.txt",
+                        help="Pose file to assemble against, relative to the input "
+                             "directory. Pass 'odometry_poses.txt' to build the "
+                             "odometry-only cloud for a drift comparison "
+                             "(default: optimized_poses.txt)")
+    parser.add_argument("--drone", type=int, default=None,
+                        help="Keep only keyframes belonging to this drone/session id. "
+                             "Lets the per-aircraft clouds of a multi-session run be "
+                             "regenerated from the merged pose graph, in the merged "
+                             "frame, without re-running it")
+    parser.add_argument("--allow-ungeoreferenced", action="store_true",
+                        help="Write a local-ENU cloud with no CRS when the datum is missing, "
+                             "instead of failing. Produces a file that cannot be combined "
+                             "with any other survey; use only for quick inspection.")
     args = parser.parse_args()
 
     # Setup paths
@@ -190,12 +483,48 @@ def main():
         else:
             print(f"WARNING: couldn't parse index from {f}; skipping.")
 
+    # Resolve the georeferencing datum before doing any work, so a missing or truncated
+    # origin fails in the first second rather than after an hour of assembly.
+    georef = None
+    if args.origin:
+        lat0, lon0, h0 = [float(v) for v in args.origin.split(",")]
+        georef = build_georeference(lat0, lon0, h0, epsg_out=args.epsg)
+    else:
+        origin_path = os.path.join(data_dir, "gnss_origin.txt")
+        if os.path.exists(origin_path):
+            lat0, lon0, h0 = load_gnss_origin(origin_path)
+            georef = build_georeference(lat0, lon0, h0, epsg_out=args.epsg)
+        elif not args.allow_ungeoreferenced:
+            raise RuntimeError(
+                "No gnss_origin.txt in %s and no --origin given, so the cloud cannot be "
+                "georeferenced. Every LAS produced before this check existed was written in "
+                "an anonymous local ENU frame and is not recoverable after the fact -- that "
+                "is precisely the failure this guard prevents. Pass --origin LAT,LON,ALT, or "
+                "--allow-ungeoreferenced if you knowingly want a local-frame file."
+                % data_dir)
+        else:
+            print("WARNING: writing an UNGEOREFERENCED local-ENU cloud with no CRS.")
+
+    if georef:
+        print("Georeferencing to EPSG:%d" % georef["epsg"])
+        print("  datum          : %.9f, %.9f, %.4f m (ellipsoidal)"
+              % (georef["origin_lat"], georef["origin_lon"], georef["origin_ellipsoidal_h"]))
+        print("  origin easting : %.4f" % georef["easting"])
+        print("  origin northing: %.4f" % georef["northing"])
+        print("  origin height  : %.4f m NN2000 (was %.4f m ellipsoidal)"
+              % (georef["orthometric_h"], georef["origin_ellipsoidal_h"]))
+        print("  convergence    : %.6f deg   grid scale: %.9f"
+              % (georef["meridian_convergence_deg"], georef["grid_scale_factor"]))
+        print("  geoid sep      : %.4f m applied" % georef["geoid_separation_m"])
+
     # Load poses
-    poses_path = os.path.join(data_dir, "optimized_poses.txt")
+    poses_path = os.path.join(data_dir, args.poses)
+    if not os.path.exists(poses_path):
+        raise FileNotFoundError(f"Pose file not found: {poses_path}")
     poses, drone_ids, session_starts, offset_x, offset_y = load_poses(poses_path)
 
     if not poses:
-        raise RuntimeError("No poses parsed from optimized_poses.txt")
+        raise RuntimeError(f"No poses parsed from {poses_path}")
 
     # Add implicit first session start
     all_session_starts = [0] + session_starts
@@ -227,7 +556,8 @@ def main():
                    (args.end_frame is None or idx <= args.end_frame) and
                    not is_ignored(idx) and
                    idx not in exclude_set and
-                   idx in poses]
+                   idx in poses and
+                   (args.drone is None or drone_ids.get(idx, 0) == args.drone)]
 
     if not kf_files:
         raise RuntimeError("No parsable keyframe indices in scans/ filenames after filtering.")
@@ -318,24 +648,60 @@ def main():
     np_kf_all = np.vstack(kf_chunks)
     np_drone_all = np.vstack(drone_chunks)
 
-    # Save LAS
-    header = laspy.LasHeader(point_format=3, version="1.2")
+    # Local ENU -> projected coordinates. Done in float64: an easting of ~600 700 m has a
+    # float32 spacing of ~0.06 m, which would quantise the map far more coarsely than the
+    # 0.001 m LAS scale suggests.
+    if georef:
+        A = georef["linear_map"]
+        e = np_xyz_all[:, 0].astype(np.float64)
+        n = np_xyz_all[:, 1].astype(np.float64)
+        out_x = georef["easting"] + A[0, 0] * e + A[0, 1] * n
+        out_y = georef["northing"] + A[1, 0] * e + A[1, 1] * n
+        out_z = georef["orthometric_h"] + np_xyz_all[:, 2].astype(np.float64)
+        del e, n
+        las_offsets = np.array([georef["easting"], georef["northing"],
+                                georef["orthometric_h"]])
+    else:
+        out_x = np_xyz_all[:, 0].astype(np.float64)
+        out_y = np_xyz_all[:, 1].astype(np.float64)
+        out_z = np_xyz_all[:, 2].astype(np.float64)
+        las_offsets = np.array([0.0, 0.0, 0.0])
+
+    # Save LAS. Version 1.4 so the CRS can be written as a WKT VLR -- the GeoTIFF keys of
+    # LAS 1.2 cannot express a compound horizontal+vertical CRS, and a file that claims
+    # EPSG:25832 while carrying NN2000 heights is worse than one that claims nothing.
+    # The point format is unchanged, so readers see the same record layout as before.
+    header = laspy.LasHeader(point_format=3, version="1.4")
     header.scales = np.array([0.001, 0.001, 0.001])
-    header.offsets = np.array([0.0, 0.0, 0.0])
+    header.offsets = las_offsets
 
     # Add extra dimensions for keyframe and drone ID
     header.add_extra_dim(ExtraBytesParams(name="keyframe", type=np.uint16))
     header.add_extra_dim(ExtraBytesParams(name="drone_id", type=np.uint8))
 
+    if georef:
+        import pyproj
+        header.add_crs(pyproj.CRS.from_epsg(georef["epsg"]))
+
     las = laspy.LasData(header)
-    las.x = np_xyz_all[:, 0]
-    las.y = np_xyz_all[:, 1]
-    las.z = np_xyz_all[:, 2]
+    las.x = out_x
+    las.y = out_y
+    las.z = out_z
     las.intensity = np.clip(np_intensity_all[:, 0], 0, 65535).astype(np.uint16)
     las["keyframe"] = np_kf_all[:, 0]
     las["drone_id"] = np_drone_all[:, 0]
+    # Mirror the aircraft identity into the standard field as well. drone_id is a LAS extra
+    # dimension, which readers that do not understand extra bytes silently drop; 0 in
+    # point_source_id conventionally means "this file", so the ids are stored 1-based.
+    las.point_source_id = (np_drone_all[:, 0].astype(np.uint16) + 1)
     las.write(output_path)
     print(f"LAS file saved: {output_path}  (points: {np_xyz_all.shape[0]:,})")
+
+    write_trajectories(output_path, data_dir, georef)
+    write_provenance(output_path, data_dir, args, georef, kf_files, drone_ids,
+                     all_session_starts, np_xyz_all.shape[0],
+                     dict(node_skip=NODE_SKIP, near_removal=NEAR_REMOVAL,
+                          near_thresh=NEAR_THRESH))
 
 
 if __name__ == "__main__":

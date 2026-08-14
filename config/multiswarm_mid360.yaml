@@ -67,11 +67,19 @@ spade_pgo:
   # ROS I/O
   ros:
     gps_topic: "/mavros/global_position/global"
+    gps_topic_fallback: "/mavros/global_position/raw/fix"  # used if gps_topic is absent ("" = none)
     pointcloud_topic: "/cloud_registered_body"
     orientation_topic: "/mavros/global_position/local"
     orientation_msg_type: "odometry"
     lio_odometry_topic: "/Odometry"
     save_directory: "/home/ros/save/pointclouds/"
+
+  # Per-bag sensor checks run by the orchestrator before playback [Hz]
+  preflight:
+    min_lidar_rate: 5.0             # fatal below
+    min_imu_rate: 25.0              # fatal below
+    min_gnss_rate: 0.2              # degrade below (run without GNSS)
+    min_orientation_rate: 1.0       # degrade below (run without orientation)
 
   # ICP (registration of loop candidates / submaps)
   icp:
@@ -85,6 +93,7 @@ spade_pgo:
     max_iterations: 40              # Max ICP iterations
     max_height_above_ground: 7.0    # Filter points above this height relative to min z [m] (0 = disabled)
     max_radius_from_keyframe: 20.0   # Filter points beyond this distance from keyframe [m] (0 = disabled)
+    zero_init_z: true               # Seed ICP with the two keyframes at equal height
     save_pointclouds: false
     publish_pointclouds: true
 
@@ -98,10 +107,11 @@ spade_pgo:
     prior_noise_rot: 1.0            # Prior noise on initial orientation [rad]
     use_gnss_altitude: true
     gnss_min_initialization_distance: 15.0  # Distance before enabling GNSS [m]
+    gnss_time_delta: 0.4            # Max keyframe-to-fix time gap for a match [s].
     gps_noise_threshold: 1e9        # Max covariance for GNSS fix
     gps_noise_scale: 10.0           # Variance scaling for GNSS XY
-    gps_noise_z_scale: 50.0        # Variance scaling for GNSS Z
-    loop_closure_noise_scale: 1e-3
+    gps_noise_z_scale: 10.0        # Variance scaling for GNSS Z
+    loop_closure_noise_scale: 1e-2
     orientation_noise: 1.0          # Orientation noise std dev [rad]
 
   # Scan Context (loop candidate search)
@@ -114,9 +124,9 @@ spade_pgo:
   # Near-keyframe loop closure
   near_kf:
     enabled: true
-    distance_threshold: 10.0        # Consider keyframes within this radius [m]
-    min_consecutive_kf_distance: 5.0  # Min travel between candidates [m]
-    min_kf_seperation: 30           # Min keyframe index separation
+    distance_threshold: 20.0        # Consider keyframes within this radius [m]
+    min_consecutive_kf_distance: 4.0  # Min travel between candidates [m] (intra-session only)
+    min_kf_seperation: 40           # Min keyframe index separation (intra-session only)
 
   # Visualization
   visualize:

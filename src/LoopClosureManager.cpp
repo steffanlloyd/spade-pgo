@@ -116,10 +116,10 @@ void LoopClosureManager::processCandidateQueue()
 
         // Do ICP, add graph factor if valid (ICP is expensive, do outside mutex)
         if(auto relative_pose = this->icp(kf_prev, kf_curr)) {
-            auto [Ticp, fitness_score] = relative_pose.value();
+            auto [T_between, fitness_score] = relative_pose.value();
 
             // Add to list of loop closures to add to graph
-            this->graph_manager_->addLoopClosureFactor(kf_prev, kf_curr, Ticp, fitness_score);
+            this->graph_manager_->addLoopClosureFactor(kf_prev, kf_curr, T_between, fitness_score);
 
             // Add to list of added loop closures (thread-safe)
             {
@@ -187,6 +187,14 @@ std::optional<std::pair<Eigen::Isometry3d, double>> LoopClosureManager::icp( int
     else ROS_ERROR("Invalid small_gicp method: %s", this->params_->icp.algorithm.c_str());
 
     Isometry3d init_transform = Isometry3d::Identity();
+    if (this->params_->icp.zero_init_z) {
+        // Vertical offset between two loop-closure keyframes is drift, not real: GNSS
+        // altitude is downweighted by gps_noise_z_scale, so nothing else constrains z.
+        // init_T is T_target_source, so it carries source (curr) into target (prev).
+        init_transform.translation().z() =
+            kf_poses.at(kf_prev).translation().z() - kf_poses.at(kf_curr).translation().z();
+    }
+    const double init_z = init_transform.translation().z();
     small_gicp::RegistrationResult result = small_gicp::align(target->points, source->points, init_transform, settings);
 
     Isometry3d correction_transform = result.T_target_source;
@@ -194,8 +202,8 @@ std::optional<std::pair<Eigen::Isometry3d, double>> LoopClosureManager::icp( int
 
     // Guard against division by zero when no inliers found
     if (result.num_inliers == 0) {
-        ROS_WARN("[Loop Closure] ICP found no inliers between %d and %d. Skipping. ICP runtime: %.3g ms.",
-                 kf_prev, kf_curr, icp_runtime_ms);
+        ROS_WARN("[Loop Closure] ICP found no inliers between %d and %d. Skipping. ICP runtime: %.3g ms. Init z: %.3g m.",
+                 kf_prev, kf_curr, icp_runtime_ms, init_z);
         return std::nullopt;
     }
 
@@ -211,15 +219,20 @@ std::optional<std::pair<Eigen::Isometry3d, double>> LoopClosureManager::icp( int
     float fitness_score = result.error / result.num_inliers;
 
     if (!result.converged || std::isnan(fitness_score) || fitness_score > this->params_->icp.fitness_threshold) {
-        ROS_WARN("[Loop Closure] ICP fitness test failed (%.4g > %.4g). Not adding loop closure between %d and %d. ICP runtime: %.3g ms. Distance: %.4g m. Inliers: %zu.",
-                 fitness_score, this->params_->icp.fitness_threshold, kf_prev, kf_curr, icp_runtime_ms, correction_transform.translation().norm(), result.num_inliers);
+        ROS_WARN("[Loop Closure] ICP fitness test failed (%.4g > %.4g). Not adding loop closure between %d and %d. ICP runtime: %.3g ms. Distance: %.4g m. Inliers: %zu. Init z: %.3g m. Corr z: %.3g m.",
+                 fitness_score, this->params_->icp.fitness_threshold, kf_prev, kf_curr, icp_runtime_ms, correction_transform.translation().norm(), result.num_inliers, init_z, correction_transform.translation().z());
         return std::nullopt;
     } else {
-        ROS_INFO("[Loop Closure] ICP fitness test passed (%.4g < %.4g). Adding loop closure between %d and %d. ICP runtime: %.3g ms. Distance: %.4g m. Inliers: %zu.",
-                 fitness_score, this->params_->icp.fitness_threshold, kf_prev, kf_curr, icp_runtime_ms, correction_transform.translation().norm(), result.num_inliers);
+        ROS_INFO("[Loop Closure] ICP fitness test passed (%.4g < %.4g). Adding loop closure between %d and %d. ICP runtime: %.3g ms. Distance: %.4g m. Inliers: %zu. Init z: %.3g m. Corr z: %.3g m.",
+                 fitness_score, this->params_->icp.fitness_threshold, kf_prev, kf_curr, icp_runtime_ms, correction_transform.translation().norm(), result.num_inliers, init_z, correction_transform.translation().z());
     }
 
-    return std::make_pair(correction_transform, fitness_score);
+    // Compose here, not in addLoopClosureFactor: correction_transform is only meaningful
+    // against the kf_poses snapshot taken above, and iSAM2 may move them before the factor
+    // is created. Result is the BetweenFactor measurement X_prev^-1 * X_curr_corrected.
+    Eigen::Isometry3d T_between = kf_poses.at(kf_prev).inverse() * correction_transform * kf_poses.at(kf_curr);
+
+    return std::make_pair(T_between, fitness_score);
 
 } // icp
 

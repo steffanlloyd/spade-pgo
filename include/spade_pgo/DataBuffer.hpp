@@ -45,9 +45,15 @@ public:
     bool dataAvailable(bool lock_mutex = true);
     void clearAll();
 
+    /// Number of unusable GNSS fixes dropped by pushGNSS since the last clearAll().
+    uint64_t gnssRejectedCount() const;
+
     double gnssAllowedTimeDelta;
 
 private:
+    /// Unusable fixes dropped by pushGNSS; reset per session by clearAll(). Guarded by buffer_mutex_.
+    uint64_t gnss_rejected_count_ = 0;
+
     std::queue<nav_msgs::Odometry::ConstPtr> odom_buffer_;
     std::queue<sensor_msgs::PointCloud2ConstPtr> cloud_buffer_;
     std::queue<sensor_msgs::NavSatFix::ConstPtr> gnss_buffer_;

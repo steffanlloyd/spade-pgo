@@ -197,6 +197,7 @@ All SPADE-PGO parameters are under the `spade_pgo/` namespace. See `config/multi
 | `prior_noise_rot` | double | `0.2` | Prior noise on initial orientation [rad]. |
 | `use_gnss_altitude` | bool | `true` | Include GNSS altitude in optimization. |
 | `gnss_min_initialization_distance` | double | `5.0` | Minimum travel distance before GNSS initializes [m]. |
+| `gnss_time_delta` | double | `0.1` | Maximum keyframe-to-fix timestamp gap for a GNSS match [s]. |
 | `gps_noise_threshold` | double | `4.0` | Maximum GNSS covariance to accept a fix. |
 | `gps_noise_scale` | double | `1.0` | Scaling factor for GNSS XY variance. |
 | `gps_noise_z_scale` | double | `100.0` | Scaling factor for GNSS altitude variance. |

@@ -7,6 +7,7 @@
 #include <Eigen/Dense>
 #include <iostream>
 #include <fstream>
+#include <iomanip>
 
 // SPADE PGO includes
 #include "spade_pgo/common.hpp"
@@ -54,6 +55,8 @@ PoseGraphManager::PoseGraphManager(
     isam_params.relinearizeThreshold = 0.01;
     isam_params.relinearizeSkip = 1;
     this->isam_ = gtsam::ISAM2(isam_params);
+
+    this->data_buffer.gnssAllowedTimeDelta = this->params->graph.gnss_time_delta;
 
     // Setup voxel filters
     this->voxelizer_sc_.setLeafSize(this->params->sc.voxel_size, this->params->sc.voxel_size, this->params->sc.voxel_size);
@@ -281,6 +284,7 @@ void PoseGraphManager::addPriorFactorandEstimate(const Eigen::Isometry3d &T, int
     ROS_INFO("Added prior factor at keyframe %d", kf_id);
 }
 
+
 /**
  * @brief Adds a GNSS factor to the pose graph at a specified keyframe index, and adds the estimate.
  * @param kf_index The keyframe index for the GNSS factor.
@@ -397,6 +401,13 @@ void PoseGraphManager::addGNSSFactor(int kf_index, nav_msgs::Odometry::ConstPtr 
 
     // If covariance is too high, exit
     if(gnss_pose.covariance[0] > this->params->graph.gps_noise_threshold || gnss_pose.covariance[7] > this->params->graph.gps_noise_threshold) return;
+
+    // Discard non-positive variances (sometimes used when no fix); sqrt would give a NaN sigma
+    if(gnss_pose.covariance[0] <= 0.0 || gnss_pose.covariance[7] <= 0.0 || gnss_pose.covariance[14] <= 0.0){
+        ROS_WARN_THROTTLE(5, "Discarding GNSS factor at kf %d: non-positive position variance (%.3f, %.3f, %.3f)",
+                          kf_index, gnss_pose.covariance[0], gnss_pose.covariance[7], gnss_pose.covariance[14]);
+        return;
+    }
 
     // Check if orientation is provided (non-zero orientation covariance indicates orientation is set)
     bool has_orientation = (gnss_pose.covariance[35] > 0);  // Check yaw variance
@@ -515,9 +526,11 @@ void PoseGraphManager::addGNSSFactor(int kf_index, nav_msgs::Odometry::ConstPtr 
  * @param kf_index_2 The index of the second keyframe.
  * @param Ticp The transformation matrix representing the loop closure.
  */
-void PoseGraphManager::addLoopClosureFactor(int kf_prev, int kf_curr, Eigen::Isometry3d T_icp, double fitnessScore)
+void PoseGraphManager::addLoopClosureFactor(int kf_prev, int kf_curr, Eigen::Isometry3d T_between, double fitnessScore)
 {
-    gtsam::Pose3 betweenPose = gtsam::Pose3(T_icp.inverse().matrix());
+    // Already the relative pose X_prev^-1 * X_curr_corrected, composed in icp() against the
+    // pose snapshot the registration used.
+    gtsam::Pose3 betweenPose = gtsam::Pose3(T_between.matrix());
 
     // Initialize noise vector
     gtsam::Vector robustNoiseVector6(6);
@@ -616,15 +629,24 @@ void PoseGraphManager::processData(DataPoint data)
         this->T0_ = T_session_start;
         int new_kf_index = this->addKeyframe(T_session_start, pointcloud, data.timestamp_lio);
 
-        // Add initial factor and estimate
-        if (this->params->useGNSS() && data.gnss_msg.has_value()) {
-            // GNSS available: add the estimate directly and use addGNSSFactor for the constraint
-            auto gnss_odom = this->navSatFixToOdometry(data.gnss_msg.value(), data.orientation_msg, false);
-            this->addGNSSFactorAndEstimate(new_kf_index, gnss_odom, T_session_start);
-        } else {
-            // No GNSS: use prior factor with fixed noise
-            this->addPriorFactorandEstimate(T_session_start, new_kf_index);
-        }
+        // Anchor the session with a fixed-noise prior, in every case.
+        //
+        // T_session_start already carries everything a GNSS-derived factor would have
+        // supplied: the external orientation (set above, when available) and the GNSS
+        // position -- exactly (0,0,0) for the first session because the datum was just
+        // reset to this fix, and the converted position in the existing frame for every
+        // session after it. So there is nothing left for a separate GNSS factor to add
+        // here, and no reason to branch.
+        //
+        // Using the prior instead of addGNSSFactorAndEstimate also fixes the conditioning.
+        // The GNSS factor derives its sigmas from the fix covariance scaled by
+        // gps_noise_scale (and gps_noise_z_scale vertically), which on a below-canopy fix
+        // is metres before scaling and tens of metres after. That is loose enough to leave
+        // the session's first pose effectively unconstrained, and iSAM2 fails with
+        // IndeterminantLinearSystemException on that variable. The prior uses
+        // prior_noise_lin, and prior_noise_rot / orientation_noise for rotation, which are
+        // fixed, moderate, and independent of whatever the receiver reports.
+        this->addPriorFactorandEstimate(T_session_start, new_kf_index);
 
         // Clear awaiting flag
         this->awaiting_session_init_ = false;
@@ -756,11 +778,27 @@ void PoseGraphManager::saveGraphKeyframes() const
     std::string filename_kf = this->params->ros.save_directory + "optimized_poses.txt";
     saveTransformsToFile(this->getUpdatedKFPoses(), this->kf_session_ids_, filename_kf);
 
+    // The pre-optimisation poses, in the same keyframe index space. These are the FAST-LIO
+    // odometry poses as they were when each keyframe was created, before any loop closure
+    // or iSAM2 update touched them -- within a session, that is pure dead reckoning; across
+    // sessions each start pose is still anchored by its first GNSS fix. Differencing the two
+    // files gives the drift the pose graph removed, which is otherwise unrecoverable once
+    // the run is over.
+    std::string filename_odom = this->params->ros.save_directory + "odometry_poses.txt";
+    saveTransformsToFile(this->kf_poses_odom_, this->kf_session_ids_, filename_odom);
+
     if(!this->gnss_origin_) return;
 
     std::string filename_gnss_origin = this->params->ros.save_directory + "gnss_origin.txt";
     std::fstream stream(filename_gnss_origin.c_str(), std::fstream::out);
-    stream << "latitude: " << this->gnss_origin_.value()(0) << " longitude: " << this->gnss_origin_.value()(1) << " altitude: " << this->gnss_origin_.value()(2) << std::endl;
+    // Full precision: the default ostream precision (6 significant figures) truncates
+    // latitude/longitude to ~5.5 m N-S and ~2.8 m E-W, which is coarser than the
+    // stem-level accuracy the maps are used for.
+    // std::fixed keeps trailing zeros, so the decimal count always reflects true precision.
+    stream << std::fixed << std::setprecision(9)
+           << "latitude: " << this->gnss_origin_.value()(0)
+           << " longitude: " << this->gnss_origin_.value()(1)
+           << " altitude: " << this->gnss_origin_.value()(2) << std::endl;
 }
 
 /**
@@ -858,7 +896,7 @@ nav_msgs::Odometry::ConstPtr PoseGraphManager::navSatFixToOdometry(
 /**
  * @brief Re-initializes the PGO session for a new session in a multi-session run.
  *
- * Increments the session ID, clears the data buffer, and sets the flag to await
+ * Advances the session ID, clears the data buffer, and sets the flag to await
  * session initialization on the next processData call.
  * The ScanContext database is preserved to enable inter-session loop closures.
  *
@@ -866,7 +904,9 @@ nav_msgs::Odometry::ConstPtr PoseGraphManager::navSatFixToOdometry(
  */
 int PoseGraphManager::reinitializeSession()
 {
-    this->current_session_id_++;
+    // Only advance if the current session actually produced something, so the orchestrator can
+    // call reinit before every bag (including the first) without leaving a gap in the ids
+    if (!this->kf_poses_odom_.empty()) this->current_session_id_++;
 
     int next_kf_index = this->kf_poses_odom_.size();
 
