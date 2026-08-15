@@ -125,6 +125,48 @@ rosrun spade_pgo assemble.py --exclude-start 2 -o /path/to/output.las
 
 The output LAS file includes per-point `keyframe` and `session_id` attributes for filtering and analysis.
 
+### Post-processing an assembled cloud
+
+Two corrections turn an assembled cloud into a releasable one. **The order matters**: the trim
+projects to XY, so trimming a tilted cloud cuts the wrong footprint.
+
+```bash
+# 1. rotate onto gravity, measured from the source bag's IMU
+rosrun spade_pgo gravity_align.py --las map.las --bag flight.bag -o map_rot.las
+# 2. cut the sparse XY fringe
+rosrun spade_pgo trim_cloud.py --input map_rot.las -o map_final.las
+# check either one at any point
+rosrun spade_pgo sanity_check.py map_final.las --bags /path/to/bags
+```
+
+`gravity_align.py` finds IMU windows in which the platform is not accelerating, rotates each
+window's mean specific force into the map frame, and takes the median. It rotates the LAS, the
+`_odom` twin and the trajectory CSVs together; the pose files in `pgo/` are deliberately left in
+the pipeline's local ENU frame, since they are what a cloud is regenerated from.
+
+Its window gates need setting for the platform. The defaults suit a drone that hovers before
+takeoff. A **hand-carried** rig turns continuously and passes nothing — on one such run every
+window exceeded the angular-rate gate, while the acceleration and direction gates passed 55 %
+and 6 %. Loosen the redundant proxy and keep the real test:
+
+```bash
+--accel-tol 0.15 --gyro-tol 0.30 --dir-tol 0.05 --window 0.5
+```
+
+Validated against the defaults where both find windows: 19.417 vs 19.414°, 42.610 vs 42.609°,
+4.291 vs 4.280°.
+
+Read the `terrain normal ... before, ... after` line as the independent check. It fits a plane
+through the lowest return per cell, so it measures *terrain*, not gravity — a real slope stays
+non-zero — but a correction that makes it worse is a correction that is wrong. That is how a
+merged multi-session cloud gets caught: each session carries its own attitude error, so no
+single rotation fixes all of them, and the per-aircraft estimates disagree.
+
+`trim_cloud.py` keeps 1 m XY cells at or above `--min-points`, closes them, fills interior
+holes, keeps the largest connected component and dilates by a cell. A cell is kept whole or
+dropped whole, so interior density is untouched — it is not `grid_cleanup.py`. Pass
+`--apply-mask <other>.trim.json` to give a derived product the identical cut.
+
 ### Point Cloud Cleanup
 
 If the merger didn't go perfectly, you'll get duplicate trees (since point clouds are slightly offset from one another). To fix this, you can use the grid_cleanup script:

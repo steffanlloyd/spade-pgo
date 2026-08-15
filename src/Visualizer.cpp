@@ -29,7 +29,7 @@ Visualizer::Visualizer(
     this->publisher_lc_cloud_prev_= nh_.advertise<sensor_msgs::PointCloud2>("/pgo/lc_cloud_prev", 100);
 
     // Set up voxelizer
-    this->voxelizer_map_.setLeafSize(params->visualize.voxel_size, params->visualize.voxel_size, params->visualize.voxel_size);
+    this->map_voxel_size_ = params->visualize.voxel_size;
 
     // Make save directory
     this->lc_pcd_directory_ = params->ros.save_directory + "lc_pcd/";
@@ -139,10 +139,18 @@ void Visualizer::publishMap(int frame_skip)
     // Assemble the global point cloud using updated poses
     pcl::PointCloud<PointType>::Ptr globalCloud = this->graph_manager_->assembleGlobalPointCloud(frame_skip);
 
-    // Downsample the map into a separate cloud: filtering in place aliases input and output.
+    // Octree: no dense index to overflow, and unlike ApproximateVoxelGrid it does not need
+    // spatially coherent input. See test/test_voxelizer.cpp.
     pcl::PointCloud<PointType>::Ptr mapCloud(new pcl::PointCloud<PointType>());
-    this->voxelizer_map_.setInputCloud(globalCloud);
-    this->voxelizer_map_.filter(*mapCloud);
+    pcl::octree::OctreePointCloudVoxelCentroid<PointType> voxelizer(this->map_voxel_size_);
+    voxelizer.setInputCloud(globalCloud);
+    voxelizer.addPointsFromInputCloud();
+    pcl::octree::OctreePointCloudVoxelCentroid<PointType>::AlignedPointTVector centroids;
+    voxelizer.getVoxelCentroids(centroids);
+    mapCloud->points.assign(centroids.begin(), centroids.end());
+    mapCloud->width = mapCloud->points.size();
+    mapCloud->height = 1;
+    mapCloud->is_dense = true;
 
     // Convert the point cloud to ROS message and publish
     sensor_msgs::PointCloud2 mapMsg;

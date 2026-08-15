@@ -21,6 +21,8 @@ Checks
                This is the strongest available check: it is an external reference the pose
                graph is only loosely tied to, so a solution that has folded or rotated shows
                up immediately as a large residual.
+  gnss_z       the vertical half of the same comparison, reported separately. Nothing else
+               constrains z strongly, so vertical error is where a bad solve hides.
   drift        optimised vs odometry-only trajectory, reported for the D4.2 drift columns
 """
 
@@ -45,6 +47,12 @@ MAX_KF_STEP_M = 25.0
 # the trajectory is not expected to sit on it. Tens of metres, though, means it has drifted
 # free of its anchor.
 MAX_GNSS_MEDIAN_M = 20.0
+# Vertical is checked as spread about the median offset, not as an absolute difference: the
+# altitude convention of a NavSatFix is not reliably ellipsoidal across our sources, so a
+# constant tens-of-metres bias is a datum question, while scatter about it is a broken graph.
+MAX_GNSS_VERTICAL_SPREAD_M = 15.0
+# A bias this large is worth saying out loud even though it does not fail the check.
+GNSS_VERTICAL_BIAS_WARN_M = 5.0
 
 results = []
 
@@ -203,7 +211,16 @@ def check_drift(stem):
 
 
 def check_gnss(traj, bags_dir, crs):
-    """Compare the optimised trajectory against the raw GNSS fixes in the source bags."""
+    """
+    Compare the optimised trajectory against the raw GNSS fixes in the source bags, in 3D.
+
+    Horizontal and vertical are reported separately and on purpose. For each fix we take the
+    horizontally nearest trajectory vertex and read off the height difference there, rather
+    than taking a 3D nearest neighbour, which would let a vertical error hide as a horizontal
+    one. Vertical is then split into a median offset and the scatter about it, because the
+    altitude datum of a NavSatFix is not consistent across our GNSS sources while the scatter
+    is meaningful regardless.
+    """
     if traj is None or crs is None or not bags_dir:
         return
     try:
@@ -218,8 +235,7 @@ def check_gnss(traj, bags_dir, crs):
         record("WARN", "gnss", "no bags under %s" % bags_dir)
         return
 
-    tr = pyproj.Transformer.from_crs(pyproj.CRS.from_epsg(4326), crs, always_xy=True)
-    lat, lon = [], []
+    lat, lon, alt = [], [], []
     for b in bags:
         try:
             with rosbag.Bag(b) as bag:
@@ -230,29 +246,64 @@ def check_gnss(traj, bags_dir, crs):
                 if not t:
                     continue
                 for _, m, _ in bag.read_messages(topics=[t]):
-                    if np.isfinite(m.latitude) and m.latitude != 0.0:
-                        lat.append(m.latitude); lon.append(m.longitude)
+                    if np.isfinite(m.latitude) and m.latitude != 0.0 and np.isfinite(m.altitude):
+                        lat.append(m.latitude); lon.append(m.longitude); alt.append(m.altitude)
         except Exception as e:
             record("WARN", "gnss", "%s: %s" % (os.path.basename(b), e))
     if not lat:
         record("WARN", "gnss", "no usable fixes in the source bags")
         return
 
-    E, N = tr.transform(np.array(lon), np.array(lat))
+    lat, lon, alt = np.array(lat), np.array(lon), np.array(alt)
+    # 4979 rather than 4326: the vertical component has to go through the geoid model to land
+    # in the cloud's orthometric datum. Falling back to 2D loses the height entirely.
+    try:
+        tr = pyproj.Transformer.from_crs(pyproj.CRS.from_epsg(4979), crs, always_xy=True)
+        E, N, H = tr.transform(lon, lat, alt)
+        if not np.all(np.isfinite(H)):
+            raise ValueError("vertical transform produced non-finite heights")
+    except Exception as e:
+        record("WARN", "gnss", "3D transform unavailable (%s); checking horizontal only" % e)
+        tr = pyproj.Transformer.from_crs(pyproj.CRS.from_epsg(4326), crs, always_xy=True)
+        E, N = tr.transform(lon, lat)
+        H = None
+
     T = traj[:, 2:4]
-    # Distance from each fix to the nearest point on the trajectory, in blocks to bound memory.
+    Z = traj[:, 4]
+    # Nearest trajectory vertex per fix, in blocks to bound memory.
     dmin = np.empty(len(E))
+    idx = np.empty(len(E), dtype=int)
     for i in range(0, len(E), 2000):
         blk = np.column_stack([E[i:i+2000], N[i:i+2000]])
         d = np.linalg.norm(blk[:, None, :] - T[None, :, :], axis=2)
         dmin[i:i+2000] = d.min(axis=1)
+        idx[i:i+2000] = d.argmin(axis=1)
+
     med = float(np.median(dmin))
-    msg = ("%d fixes, distance to trajectory: median %.2f m, 95th %.2f m, max %.2f m"
-           % (len(dmin), med, np.percentile(dmin, 95), dmin.max()))
+    msg = ("%d fixes, horizontal distance to trajectory: median %.2f m, 95th %.2f m, "
+           "max %.2f m" % (len(dmin), med, np.percentile(dmin, 95), dmin.max()))
     if med > MAX_GNSS_MEDIAN_M:
         record("FAIL", "gnss", msg + " -- trajectory has drifted free of its GNSS anchor")
     else:
         record("PASS", "gnss", msg)
+
+    if H is None:
+        record("WARN", "gnss_z", "no vertical comparison -- the 3D transform was unavailable")
+        return
+
+    dz = H - Z[idx]
+    bias = float(np.median(dz))
+    spread = float(np.median(np.abs(dz - bias)))
+    zmsg = ("vertical offset median %+.2f m, scatter about it %.2f m (95th %.2f m)"
+            % (bias, spread, np.percentile(np.abs(dz - bias), 95)))
+    if spread > MAX_GNSS_VERTICAL_SPREAD_M:
+        record("FAIL", "gnss_z", zmsg + " -- the trajectory does not track GNSS altitude")
+    elif abs(bias) > GNSS_VERTICAL_BIAS_WARN_M:
+        record("WARN", "gnss_z", zmsg + " -- large constant offset: either genuine vertical "
+                                        "drift, or the source topic's altitude datum differs "
+                                        "from NN2000")
+    else:
+        record("PASS", "gnss_z", zmsg)
 
 
 def main():

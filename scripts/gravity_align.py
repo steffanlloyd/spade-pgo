@@ -116,7 +116,7 @@ def load_poses(pgo_dir):
     return times[:n], np.asarray(rots[:n])
 
 
-def static_windows(t, a, w, win_s, accel_tol, gyro_tol):
+def static_windows(t, a, w, win_s, accel_tol, gyro_tol, dir_tol=0.05):
     """
     Yield (t_mid, mean_accel) for each non-overlapping window in which the platform is not
     accelerating: |a| within accel_tol of g, and angular rate below gyro_tol throughout.
@@ -134,26 +134,30 @@ def static_windows(t, a, w, win_s, accel_tol, gyro_tol):
         if np.max(np.linalg.norm(ww, axis=1)) > gyro_tol:
             continue
         # Reject windows whose direction is still swinging: a coordinated turn can hold |a|
-        # near g while the vector rotates.
+        # near g while the vector rotates. dir_tol is a chord length on the unit sphere, so
+        # 0.05 is about 2.9 deg -- tight enough that a walking operator passes nothing, which
+        # is why it is tunable rather than fixed.
         u = aw / mag[:, None]
-        if np.linalg.norm(u - u.mean(axis=0), axis=1).max() > 0.05:
+        if np.linalg.norm(u - u.mean(axis=0), axis=1).max() > dir_tol:
             continue
         out.append((float(t[i:i + n].mean()), aw.mean(axis=0)))
     return out
 
 
-def measure_up(bag_path, pgo_dir, imu_topic, win_s, accel_tol, gyro_tol, rpy_override=None):
+def measure_up(bag_path, pgo_dir, imu_topic, win_s, accel_tol, gyro_tol, rpy_override=None,
+               outlier_deg=5.0, dir_tol=0.05):
     """Median 'up' direction in the map (ENU) frame, plus diagnostics."""
     topic, t, a, w, unit_scale = read_imu(bag_path, imu_topic)
     kf_t, kf_R = load_poses(pgo_dir)
     R_body_lidar, rpy = load_extrinsic(pgo_dir, rpy_override)
 
-    wins = static_windows(t, a, w, win_s, accel_tol, gyro_tol)
+    wins = static_windows(t, a, w, win_s, accel_tol, gyro_tol, dir_tol)
     if not wins:
         raise RuntimeError(
             "No non-accelerating IMU window found (window %.1fs, |a|-g < %.2f m/s^2, "
-            "|w| < %.2f rad/s). Loosen with --accel-tol / --gyro-tol." %
-            (win_s, accel_tol, gyro_tol))
+            "|w| < %.2f rad/s, direction stable to %.3f). Loosen with --accel-tol / "
+            "--gyro-tol / --dir-tol, and shorten --window." %
+            (win_s, accel_tol, gyro_tol, dir_tol))
 
     ups, used = [], 0
     for tm, av in wins:
@@ -166,14 +170,35 @@ def measure_up(bag_path, pgo_dir, imu_topic, win_s, accel_tol, gyro_tol, rpy_ove
         used += 1
 
     ups = np.asarray(ups)
-    up = np.median(ups, axis=0)
-    up /= np.linalg.norm(up)
-    spread = np.degrees(np.arccos(np.clip(ups @ up, -1.0, 1.0)))
+
+    def med(v):
+        m = np.median(v, axis=0)
+        return m / np.linalg.norm(m)
+
+    # Reject windows that disagree with the bulk before taking the final median. A window can
+    # pass the |a| and gyro gates and still be wrong -- a steady climb, or a hover the keyframe
+    # nearest in time does not actually correspond to -- and one such window in a small sample
+    # drags the median. Rejection is reported, not silent: if most windows go, distrust the
+    # result rather than the outliers.
+    up = med(ups)
+    keep = np.degrees(np.arccos(np.clip(ups @ up, -1.0, 1.0))) <= outlier_deg
+    n_rejected = int((~keep).sum())
+    if keep.sum() >= 3 and n_rejected:
+        ups_used = ups[keep]
+        up = med(ups_used)
+    else:
+        ups_used = ups
+        n_rejected = 0
+
+    spread = np.degrees(np.arccos(np.clip(ups_used @ up, -1.0, 1.0)))
     return {
         "imu_topic": topic,
         "imu_unit_scale": unit_scale,
         "lidar_to_body_rpy": rpy,
         "n_windows": used,
+        "n_windows_used": int(len(ups_used)),
+        "n_windows_rejected": n_rejected,
+        "outlier_threshold_deg": float(outlier_deg),
         "n_imu_samples": int(len(t)),
         "up_enu": up.tolist(),
         "window_spread_deg_median": float(np.median(spread)),
@@ -242,6 +267,34 @@ def terrain_normal(las_path, cell=5.0, max_points=8_000_000):
     return n
 
 
+def rotate_traj_csv(src, dst, R, centre):
+    """
+    Rewrite a <stem>.traj.csv with its easting/northing/height rotated about centre.
+
+    These sit in the cloud's own projected CRS, the same frame R was measured in, so the same
+    matrix applies. The pose files in pgo/ are deliberately NOT rotated: they are the pipeline's
+    raw output in its local ENU frame, and they are what a cloud is regenerated from.
+    """
+    lines = open(src).read().splitlines()
+    out, hdr, n = [], None, 0
+    for line in lines:
+        if line.startswith("#") or hdr is None and not line[:1].isdigit():
+            if not line.startswith("#"):
+                hdr = [c.strip() for c in line.split(",")]
+            out.append(line)
+            continue
+        p = line.split(",")
+        if len(p) < 5:
+            out.append(line)
+            continue
+        xyz = np.array([float(p[2]), float(p[3]), float(p[4])])
+        xyz = R @ (xyz - centre) + centre
+        out.append("%s,%s,%.4f,%.4f,%.4f" % (p[0], p[1], xyz[0], xyz[1], xyz[2]))
+        n += 1
+    open(dst, "w").write("\n".join(out) + "\n")
+    return n
+
+
 def rotate_las(src, dst, R, centre):
     """Rewrite src into dst with points rotated about centre. Chunked; header rebuilt."""
     import laspy
@@ -289,10 +342,20 @@ def main():
                     help="Max |mean|a|-g| for a usable window [m/s^2]")
     ap.add_argument("--gyro-tol", type=float, default=0.05,
                     help="Max angular rate in a usable window [rad/s]")
+    ap.add_argument("--dir-tol", type=float, default=0.05,
+                    help="Max swing of the acceleration direction within a window, as a chord "
+                         "length on the unit sphere (0.05 ~ 2.9 deg)")
+    ap.add_argument("--window-outlier-deg", type=float, default=5.0,
+                    help="Discard windows further than this from the median direction before "
+                         "taking the final median")
     ap.add_argument("--max-tilt", type=float, default=30.0,
                     help="Refuse corrections larger than this [deg]")
     ap.add_argument("--force", action="store_true", help="Apply even beyond --max-tilt")
     ap.add_argument("--dry-run", action="store_true", help="Measure and report, write nothing")
+    ap.add_argument("--las-only", action="store_true",
+                    help="Rotate only the named LAS. By default the odometry twin and every "
+                         "trajectory CSV beside it are rotated too, so the whole product set "
+                         "stays in one frame.")
     args = ap.parse_args()
 
     las = args.las
@@ -311,12 +374,17 @@ def main():
 
     print("Measuring gravity from %s" % args.bag)
     m = measure_up(args.bag, pgo_dir, args.imu_topic, args.window,
-                   args.accel_tol, args.gyro_tol, args.lidar_to_body_rpy)
+                   args.accel_tol, args.gyro_tol, args.lidar_to_body_rpy,
+                   args.window_outlier_deg, args.dir_tol)
     print("  IMU topic            %s (%d samples)" % (m["imu_topic"], m["n_imu_samples"]))
     print("  accel units          %s" % ("g, rescaled to m/s^2"
                                          if m["imu_unit_scale"] != 1.0 else "m/s^2"))
     print("  lidar->body rpy      %s" % (m["lidar_to_body_rpy"] or "identity (none found)"))
-    print("  usable windows       %d" % m["n_windows"])
+    print("  usable windows       %d found, %d used, %d rejected as outliers"
+          % (m["n_windows"], m["n_windows_used"], m["n_windows_rejected"]))
+    if m["n_windows_used"] < 3:
+        print("  WARNING              fewer than 3 windows agree; the estimate rests on very "
+              "little. Loosen --accel-tol / --gyro-tol and compare.")
     print("  between-window spread %.2f deg median, %.2f deg p95"
           % (m["window_spread_deg_median"], m["window_spread_deg_p95"]))
 
@@ -358,10 +426,36 @@ def main():
     centre = np.array([geo["origin_easting"], geo["origin_northing"],
                        geo["origin_orthometric_h"]], dtype=float)
     record["rotation_centre"] = centre.tolist()
-    print("\nRotating about the datum [%.3f %.3f %.3f] -> %s" % (*centre, out))
+    print("\nRotating about the datum [%.3f %.3f %.3f]" % tuple(centre))
+
+    out_stem = out[:-4] if out.lower().endswith(".las") else out
     record["n_points"] = rotate_las(las, out, R, centre)
-    json.dump(record, open(stem + ".gravity_align.json", "w"), indent=2)
-    print("Wrote %d points" % record["n_points"])
+    written = [{"file": out, "kind": "las", "n": record["n_points"]}]
+    print("  %-58s %d points" % (os.path.basename(out), record["n_points"]))
+
+    if not args.las_only:
+        # The odometry twin gets the same matrix about the same pivot: it is the drift
+        # baseline, so it only stays comparable if it moves with the optimised cloud.
+        for src, dst, kind in (
+                (stem + "_odom.las", out_stem + "_odom.las", "las"),
+                (stem + ".traj.csv", out_stem + ".traj.csv", "csv"),
+                (stem + ".traj_odom.csv", out_stem + ".traj_odom.csv", "csv"),
+                (stem + "_odom.traj.csv", out_stem + "_odom.traj.csv", "csv"),
+                (stem + "_odom.traj_odom.csv", out_stem + "_odom.traj_odom.csv", "csv")):
+            if not os.path.exists(src):
+                continue
+            n = (rotate_las(src, dst, R, centre) if kind == "las"
+                 else rotate_traj_csv(src, dst, R, centre))
+            written.append({"file": dst, "kind": kind, "n": n})
+            print("  %-58s %d %s" % (os.path.basename(dst), n,
+                                     "points" if kind == "las" else "rows"))
+
+    record["files_written"] = written
+    record["pose_files_not_rotated"] = (
+        "optimized_poses.txt and odometry_poses.txt are left in the pipeline's local ENU "
+        "frame. They are the input a cloud is regenerated from, not a product; the correction "
+        "is recorded here instead.")
+    json.dump(record, open(out_stem + ".gravity_align.json", "w"), indent=2)
 
 
 if __name__ == "__main__":

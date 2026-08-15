@@ -21,6 +21,9 @@ Built and run inside the `fastlio-slam:latest` container — see the parent repo
 | `src/bak/` | Archived Vertliner original, not built. Kept for provenance |
 | `scripts/multiswarm_orchestrator.py` | Drives multi-bag processing end to end |
 | `scripts/assemble.py` | Keyframe PCDs + optimised poses → LAS |
+| `scripts/sanity_check.py` | Post-assembly checks: CRS, extent, keyframe jumps, drift, 3D GNSS residual |
+| `scripts/gravity_align.py` | Rotates an assembled LAS onto gravity, measured from the source bag's IMU |
+| `scripts/trim_cloud.py` | Cuts the sparse XY fringe off a gravity-corrected LAS |
 | `scripts/grid_cleanup.py` | Removes duplicate-stem ghosting from a merged LAS |
 
 ## Threading model
@@ -126,7 +129,29 @@ Coordinates are **local ENU about the datum in `gnss_origin.txt`, not UTM**.
 - `session_id`/`drone_id` is a `uint8` assigned by processing order (bags are sorted alphabetically
   by the orchestrator), not a hardware identity.
 - `grid_cleanup.py` typically discards ~1/3 of points. It hides ghosting; it does not fix
-  registration. Never run it before computing an inter-aircraft agreement metric.
+  registration. Never run it before computing an inter-aircraft agreement metric. It is **not**
+  the same thing as `trim_cloud.py`, which cuts only the outer XY fringe and keeps or drops a
+  cell whole, never thinning the interior.
+- **Post-assembly order is fixed: `gravity_align.py` then `trim_cloud.py`.** The trim projects
+  to XY, so trimming a tilted cloud cuts the wrong footprint. `gravity_align.py` rotates the
+  LAS, the odometry twin and the trajectory CSVs, but deliberately **not** `optimized_poses.txt`
+  / `odometry_poses.txt`: those are in the pipeline's local ENU frame, not the projected CRS the
+  rotation was measured in, and they are what a cloud is regenerated from.
+- `gravity_align.py` refuses above `--max-tilt` (30° default) rather than silently applying a
+  large correction, and its `between-window spread` p95 is the number to look at — a large p95
+  against a small median means the IMU windows disagree and the estimate is contaminated.
 - README says `--bag-rate` defaults to 3.0; the script's default is 4.0.
-- No tests, no CI. Validate changes by re-running a known bag set and comparing
-  `optimized_poses.txt` trajectories and loop-closure counts.
+- Almost no tests, no CI. Validate changes by re-running a known bag set and comparing
+  `optimized_poses.txt` trajectories and loop-closure counts. The one exception is
+  `test/test_voxelizer.cpp`, a standalone regression test for the map downsampler — not wired
+  into `CMakeLists.txt`; build and run it by hand, see its header.
+- **The map publisher uses `pcl::octree::OctreePointCloudVoxelCentroid`, not `pcl::VoxelGrid`.**
+  `VoxelGrid` sizes a dense `nx*ny*nz` index from the bounding box and, above `INT32_MAX`,
+  returns the cloud *unfiltered* — one stray return is enough to hand RViz the full-resolution
+  map. `ApproximateVoxelGrid` avoids that but merges only within a fixed 512-slot cache, so it
+  needs spatially coherent input; `assembleGlobalPointCloud()` concatenates keyframe by
+  keyframe, and it measured 1.26x reduction against the exact 12.1x. Do not "simplify" this
+  back to either.
+- The same `VoxelGrid` overflow still affects the **save** path (`PoseGraphManager.cpp:63`, leaf
+  `min(icp.voxel_size, sc.voxel_size)` = 0.05 m), so every `scans/*.pcd` is written at full
+  resolution. Known, deferred: it costs ICP runtime, not released geometry.

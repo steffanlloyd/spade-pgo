@@ -11,7 +11,7 @@
 #include <tf/transform_broadcaster.h>
 #include <std_msgs/ColorRGBA.h>
 #include <Eigen/Geometry>
-#include <pcl/filters/approximate_voxel_grid.h>
+#include <pcl/octree/octree_pointcloud_voxelcentroid.h>
 
 #include "spade_pgo/PoseGraphManager.hpp"
 #include "spade_pgo/PGOParams.hpp"
@@ -66,9 +66,8 @@ private:
 
     tf::TransformBroadcaster tf_broadcaster_;
 
-    // Approximate: hashes instead of allocating a dense index, so a large map cannot
-    // overflow int32 and silently leave the cloud unfiltered.
-    pcl::ApproximateVoxelGrid<PointType> voxelizer_map_;
+    // Leaf size for the map publish; the octree is built per call, as it holds the cloud.
+    double map_voxel_size_;
 
     std::string lc_pcd_directory_;
 };
