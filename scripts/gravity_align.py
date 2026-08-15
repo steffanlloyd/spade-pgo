@@ -28,6 +28,8 @@ import sys
 
 import numpy as np
 
+from provenance import stamp
+
 
 G = 9.80665
 CHUNK = 2_000_000
@@ -455,7 +457,8 @@ def main():
         "optimized_poses.txt and odometry_poses.txt are left in the pipeline's local ENU "
         "frame. They are the input a cloud is regenerated from, not a product; the correction "
         "is recorded here instead.")
-    json.dump(record, open(out_stem + ".gravity_align.json", "w"), indent=2)
+    json.dump(stamp(record, "gravity_align.py"),
+              open(out_stem + ".gravity_align.json", "w"), indent=2)
 
 
 if __name__ == "__main__":

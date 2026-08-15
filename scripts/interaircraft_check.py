@@ -45,6 +45,8 @@ import sys
 
 import numpy as np
 
+from provenance import stamp
+
 CHUNK = 4_000_000
 GRID = 1.0                      # XY cell for the overlap test and the ground estimate
 
@@ -167,9 +169,10 @@ def main(argv=None):
              else "%d of %d pairs need a look" % (len(failed), len(results))))
 
     out = args.json or (src[:-4] + ".interaircraft.json")
-    json.dump({"cloud": src, "voxel": args.voxel, "max_height": args.max_height,
-               "pairs": results, "worst_median_m": worst,
-               "n_pairs_flagged": len(failed)}, open(out, "w"), indent=2)
+    json.dump(stamp({"cloud": src, "voxel": args.voxel, "max_height": args.max_height,
+                     "pairs": results, "worst_median_m": worst,
+                     "n_pairs_flagged": len(failed)}, "interaircraft_check.py"),
+              open(out, "w"), indent=2)
     print("  record  %s" % out)
     return 1 if failed else 0
 

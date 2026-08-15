@@ -36,6 +36,8 @@ import sys
 
 import numpy as np
 
+from provenance import stamp
+
 FIX_TOPICS = ["/septentrio_gnss/navsatfix",
               "/mavros/global_position/raw/fix",
               "/mavros/global_position/global"]
@@ -53,7 +55,8 @@ def parse_args(argv=None):
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("bags", nargs="+")
-    ap.add_argument("--json", default=None, help="Write all records here as a JSON list")
+    ap.add_argument("--json", default=None,
+                    help="Write all records here (JSON: tool, git_commit, bags[])")
     return ap.parse_args(argv)
 
 
@@ -134,7 +137,7 @@ def main(argv=None):
                  r.get("fix_type_pct") or "no status topic"))
     print("\n* = EKF-fused topic, covariance is the filter's not the receiver's")
     if args.json:
-        json.dump(out, open(args.json, "w"), indent=2)
+        json.dump(stamp({"bags": out}, "gnss_probe.py"), open(args.json, "w"), indent=2)
         print("record  %s" % args.json)
     return 0
 

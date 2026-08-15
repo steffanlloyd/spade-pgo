@@ -35,6 +35,8 @@ import sys
 
 import numpy as np
 
+from provenance import stamp
+
 CHUNK = 2_000_000
 
 
@@ -227,7 +229,7 @@ def main(argv=None):
           % (hout.maxs[0] - hout.mins[0], hout.maxs[1] - hout.mins[1],
              hout.maxs[2] - hout.mins[2]))
 
-    json.dump({
+    json.dump(stamp({
         "source": src,
         "output": out,
         "points_in": int(n_src),
@@ -242,7 +244,7 @@ def main(argv=None):
         "retained_cells": int(mask.sum()),
         "retained_area_m2": float(int(mask.sum()) * cell * cell),
         "mask": mask_to_record(mask, cell, x0, y0),
-    }, open(out_stem + ".trim.json", "w"))
+    }, "trim_cloud.py"), open(out_stem + ".trim.json", "w"))
     print("           record  %s" % (out_stem + ".trim.json"))
     return 0
 

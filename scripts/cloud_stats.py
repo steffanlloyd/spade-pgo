@@ -24,6 +24,8 @@ import sys
 
 import numpy as np
 
+from provenance import stamp
+
 CHUNK = 2_000_000
 
 
@@ -224,7 +226,7 @@ def main(argv=None):
     rec.update(dm)
 
     out = args.json or (stem + ".stats.json")
-    json.dump(rec, open(out, "w"), indent=2)
+    json.dump(stamp(rec, "cloud_stats.py"), open(out, "w"), indent=2)
     print("           record  %s" % out)
     return 0
 
